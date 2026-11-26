@@ -68,6 +68,8 @@ Tabs (each tab is a session of its own; they all keep working at once)
 Sessions
   /new             start a fresh session   /sessions            pick a session to resume
   /resume <id>     open a session by id    /title <text>        rename this session
+  /logs [errors]   the daemon log in a window: this session's lines, following as they are written.
+                   e errors, w warnings, i info, a all; s this session or all; / find text
   /cd <directory>  move this session to another directory: its commands, project memory and
                    work plan are then that directory's
   /continue        pick up an interrupted or paused session where it stopped
@@ -124,6 +126,33 @@ enum Overlay {
     Models(Picker),
     Providers { data: Picker, sel: usize },
     Text { title: String, lines: Vec<String>, scroll: usize },
+}
+
+/// What the /logs window is showing: how serious, whose, and holding what.
+struct LogView {
+    /// 0 everything, 1 info and up, 2 warnings and errors, 3 errors only.
+    min: u8,
+    /// Only this session (with its subagents), or every session and the daemon itself.
+    mine: bool,
+    find: String,
+    /// The text to find is being typed.
+    typing: bool,
+}
+
+impl LogView {
+    fn title(&self, session: Option<&str>) -> String {
+        let level = ["everything", "info and up", "warnings and errors", "errors only"][self.min.min(3) as usize];
+        let whose = match (self.mine, session) {
+            (true, Some(id)) => format!("session {id}"),
+            _ => "all sessions".to_string(),
+        };
+        let find = match (self.typing, self.find.is_empty()) {
+            (true, _) => format!(" · find: {}▏", self.find),
+            (false, false) => format!(" · find: {}", self.find),
+            _ => String::new(),
+        };
+        format!("logs · {whose} · {level}{find}")
+    }
 }
 
 /// One row of the side panel.
@@ -214,6 +243,8 @@ struct App {
     completing: Option<(String, usize)>,
     /// An open /trace or /stats: which, when it was last read, and whether it follows the latest steps.
     live_view: Option<(&'static str, Instant, bool)>,
+    /// The /logs window's filters, while it is open.
+    logs: Option<LogView>,
     /// The Obsidian vault: None when none is set, else whether it can be reached, and when that was last checked.
     vault: Option<(bool, Instant)>,
     bg_tx: mpsc::UnboundedSender<Bg>,
@@ -669,6 +700,7 @@ impl App {
             pending_model: None,
             completing: None,
             live_view: None,
+            logs: None,
             vault: None,
             bg_tx,
             keys,
@@ -1212,13 +1244,19 @@ impl App {
         let Some((cmd, at, follow)) = self.live_view else { return };
         if !matches!(self.overlay, Overlay::Text { .. }) {
             self.live_view = None;
+            self.logs = None;
             return;
         }
-        if self.run_state != "running" || at.elapsed() < Duration::from_millis(1000) {
+        // The log moves whoever is working; a trace only while this session is.
+        if (cmd != "/logs" && self.run_state != "running") || at.elapsed() < Duration::from_millis(1000) {
             return;
         }
         let Some(fresh) = self.live_lines(cmd) else { return };
         if let Overlay::Text { lines, scroll, .. } = &mut self.overlay {
+            if *lines == fresh {
+                self.live_view = Some((cmd, Instant::now(), follow));
+                return;
+            }
             if follow {
                 *scroll = fresh.len();
             }
@@ -1275,6 +1313,9 @@ impl App {
 
     /// The lines of the /trace or /stats view, read from what the daemon has recorded so far.
     fn live_lines(&self, cmd: &str) -> Option<Vec<String>> {
+        if cmd == "/logs" {
+            return Some(self.log_lines());
+        }
         let root = self.session.as_ref().map(|s| s.root_id.clone())?;
         let spans = self.store.spans_for_root(&root).unwrap_or_default();
         let now = crate::telemetry::now_ms();
@@ -1297,9 +1338,81 @@ impl App {
         Some(lines)
     }
 
+    /// The daemon's log as the /logs window is set to show it.
+    fn log_lines(&self) -> Vec<String> {
+        let Some(view) = &self.logs else { return Vec::new() };
+        let file = self.paths.log_file();
+        // The last stretch of the file is plenty to look through, and quick to read every second.
+        let text = std::fs::read(&file)
+            .map(|bytes| String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(2 * 1024 * 1024)..]).into_owned())
+            .unwrap_or_default();
+        let root = self.session.as_ref().map(|s| s.root_id.as_str()).filter(|_| view.mine);
+        let mut lines = crate::telemetry::log_view(&text, view.min, root, &view.find);
+        if lines.is_empty() {
+            lines.push(if text.is_empty() {
+                format!("There is no log yet at {}.", file.display())
+            } else {
+                "Nothing in the log matches. e w i a change the level, s the session, / what to find.".to_string()
+            });
+        }
+        lines
+    }
+
+    /// Show the log again after a filter changed, at its end.
+    fn relog(&mut self) {
+        let lines = self.log_lines();
+        let title = self.logs.as_ref().map(|v| v.title(self.session.as_ref().map(|s| s.id.as_str()))).unwrap_or_default();
+        self.live_view = Some(("/logs", Instant::now(), true));
+        self.overlay = Overlay::Text { title, scroll: lines.len(), lines };
+        self.dirty = true;
+    }
+
+    /// A key pressed in the /logs window. Returns whether it was one of its own.
+    fn log_key(&mut self, code: KeyCode) -> bool {
+        let Some(view) = &mut self.logs else { return false };
+        if view.typing {
+            match code {
+                KeyCode::Enter => view.typing = false,
+                KeyCode::Esc => {
+                    view.typing = false;
+                    view.find.clear();
+                }
+                KeyCode::Backspace => {
+                    view.find.pop();
+                }
+                KeyCode::Char(c) => view.find.push(c),
+                _ => return true,
+            }
+            self.relog();
+            return true;
+        }
+        match code {
+            KeyCode::Char('e') => view.min = 3,
+            KeyCode::Char('w') => view.min = 2,
+            KeyCode::Char('i') => view.min = 1,
+            KeyCode::Char('a') => view.min = 0,
+            KeyCode::Char('s') => view.mine = !view.mine,
+            KeyCode::Char('/') => view.typing = true,
+            KeyCode::Char('c') => view.find.clear(),
+            KeyCode::Char('f') => {
+                // Back to the end, and keep up with it.
+                self.relog();
+                return true;
+            }
+            _ => return false,
+        }
+        self.relog();
+        true
+    }
+
     /// Characters of text that fit across the text overlay.
     fn overlay_text_width(&self) -> usize {
         (self.last_width.saturating_sub(6).clamp(20, 100) as usize).saturating_sub(4)
+    }
+
+    /// Whether the text overlay on screen is the log.
+    fn showing_logs(&self) -> bool {
+        self.logs.is_some() && matches!(self.overlay, Overlay::Text { .. })
     }
 
     // ---- choosing a model -------------------------------------------------
@@ -1697,7 +1810,18 @@ impl App {
                 self.panel_hidden = !self.panel_hidden;
                 self.panel_focus = false;
             }
+            "/logs" => {
+                // This session's lines if there is one, everything if not; `/logs errors` opens on the errors.
+                let min = match arg.trim() {
+                    "errors" | "error" | "e" => 3,
+                    "warnings" | "warn" | "w" => 2,
+                    _ => 0,
+                };
+                self.logs = Some(LogView { min, mine: self.session.is_some(), find: String::new(), typing: false });
+                self.relog();
+            }
             "/trace" | "/stats" => {
+                self.logs = None;
                 let cmd = if cmd == "/trace" { "/trace" } else { "/stats" };
                 let Some(lines) = self.live_lines(cmd) else {
                     self.flash("no session open yet");
@@ -1907,10 +2031,14 @@ impl App {
             }
             return;
         }
-        let close = matches!(code, KeyCode::Esc | KeyCode::Char('q'))
-            || (code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        let ctrl_c = code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.showing_logs() && !ctrl_c && self.log_key(code) {
+            return;
+        }
+        let close = matches!(code, KeyCode::Esc | KeyCode::Char('q')) || ctrl_c;
         if close {
             self.overlay = Overlay::None;
+            self.logs = None;
             return;
         }
         let page = self.view_h.saturating_sub(4).max(1);
@@ -2675,9 +2803,18 @@ impl App {
                 Some((*sel).min(data.all.len().saturating_sub(1))),
                 "enter show its models · esc close · add one with `narsil setup`",
             ),
+            Overlay::Text { title, lines, .. } if self.logs.is_some() => (
+                title.clone(),
+                lines.clone(),
+                None,
+                "e errors · w warnings · i info · a all · s this session/all · / find · c clear · f follow · esc close",
+            ),
             Overlay::Text { title, lines, .. } => (title.clone(), lines.clone(), None, "↑↓ scroll · esc close"),
         };
-        let w = area.width.saturating_sub(6).clamp(20, 100).min(area.width);
+        let logs = self.showing_logs();
+        // Log lines are long: the log gets the width of the window.
+        let widest = if logs { 400 } else { 100 };
+        let w = area.width.saturating_sub(6).clamp(20, widest).min(area.width);
         let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(4)).max(5).min(area.height);
         let rect = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
         let block = UiBlock::bordered()
@@ -2706,6 +2843,16 @@ impl App {
                 };
                 if Some(i) == sel {
                     Line::styled(format!(" {text:<w$}", w = inner.width.saturating_sub(1) as usize), Style::new().bg(Color::LightBlue).fg(Color::Black))
+                } else if logs {
+                    // By how serious the line is; a line that continues another keeps its colour.
+                    let level = lines[..=i].iter().rev().find_map(|l| ["ERROR", " WARN", "DEBUG", " INFO"].iter().position(|lv| l.get(12..18).is_some_and(|at| at.contains(lv))));
+                    let style = match level {
+                        Some(0) => Style::new().fg(Color::Red),
+                        Some(1) => Style::new().fg(Color::Yellow),
+                        Some(2) => Style::new().fg(Color::DarkGray),
+                        _ => Style::new(),
+                    };
+                    Line::styled(format!(" {text}"), style)
                 } else {
                     Line::raw(format!(" {text}"))
                 }

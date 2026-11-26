@@ -39,6 +39,7 @@ pub const COMMANDS: &[Cmd] = &[
     cmd("/reload", "", "re-read config.toml"),
     cmd("/forget", "<id>", "delete a memory"),
     cmd("/voice", "", "start or stop voice input"),
+    cmd("/logs", "[errors]", "the log, filtered, in a window"),
     cmd("/keys", "", "the key bindings in force"),
     cmd("/help", "", "keys and commands"),
     cmd("/quit", "", "leave; work continues"),
