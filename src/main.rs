@@ -11,6 +11,7 @@ mod obsidian;
 mod secrets;
 mod proto;
 mod provider;
+mod runview;
 mod service;
 mod setup;
 mod store;
@@ -468,6 +469,31 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
     let mut streamed = false;
     let mut failed = false;
     let mut out = std::io::stdout();
+    // On a terminal the steps and the answer are laid out to be read; into a pipe they stay
+    // as plain as scripts expect (see runview.rs).
+    let colour = std::env::var_os("NO_COLOR").is_none();
+    let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).clamp(40, 100);
+    let pretty = std::io::stderr().is_terminal();
+    let mut flow = out.is_terminal().then(|| runview::Flow::new(width, colour));
+    // What was written last: 0 nothing, 1 a step, 2 some of the answer. A blank line goes between the two kinds.
+    let mut last = 0u8;
+    macro_rules! before_step {
+        () => {
+            if let Some(flow) = &mut flow {
+                write!(out, "{}", flow.finish())?;
+                if !flow.at_line_start() || mid_line {
+                    writeln!(out)?;
+                }
+                out.flush()?;
+                *flow = runview::Flow::new(width, colour);
+                mid_line = false;
+            }
+            if pretty && last != 1 {
+                eprintln!();
+            }
+            last = 1;
+        };
+    }
     loop {
         let Some(env) = events.recv().await else { bail!("lost the connection to the daemon") };
         if env.root.is_empty() {
@@ -477,12 +503,28 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
         let who = env.agent.as_deref().map(|a| format!("[{a}] ")).unwrap_or_default();
         match env.event {
             Event::TextDelta { text } if !sub => {
-                write!(out, "{text}")?;
+                if pretty && last == 1 {
+                    eprintln!();
+                }
+                last = 2;
+                match &mut flow {
+                    Some(flow) => {
+                        write!(out, "{}", flow.push(&text))?;
+                        mid_line = !flow.at_line_start();
+                    }
+                    None => {
+                        write!(out, "{text}")?;
+                        mid_line = !text.ends_with('\n');
+                    }
+                }
                 out.flush()?;
-                mid_line = !text.ends_with('\n');
                 streamed = true;
             }
             Event::StreamReset if !sub => {
+                if let Some(flow) = &mut flow {
+                    write!(out, "{}", flow.finish())?;
+                    *flow = runview::Flow::new(width, colour);
+                }
                 if mid_line {
                     writeln!(out)?;
                     mid_line = false;
@@ -490,29 +532,64 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
                 streamed = false;
             }
             Event::Message { msg } if !sub && msg.role == Role::Assistant => {
-                if !streamed {
-                    let text = types::blocks_text(&msg.blocks);
-                    if !text.is_empty() {
-                        writeln!(out, "{text}")?;
+                let text = if streamed { String::new() } else { types::blocks_text(&msg.blocks) };
+                if !text.is_empty() {
+                    if pretty && last == 1 {
+                        eprintln!();
                     }
-                } else if mid_line {
-                    writeln!(out)?;
+                    last = 2;
                 }
+                match &mut flow {
+                    // The end of what was said: whatever the flow was holding back, and the line it was on.
+                    Some(flow) => {
+                        write!(out, "{}{}", flow.push(&text), flow.finish())?;
+                        if !flow.at_line_start() {
+                            writeln!(out)?;
+                        }
+                        *flow = runview::Flow::new(width, colour);
+                    }
+                    None if !text.is_empty() => writeln!(out, "{text}")?,
+                    None if mid_line => writeln!(out)?,
+                    None => {}
+                }
+                out.flush()?;
                 mid_line = false;
                 streamed = false;
             }
             Event::ToolStart { name, input, .. } => {
-                eprintln!("{who}> {name} {}", tools::summarize_call(&name, &input));
+                // What is shown can be seen over a shoulder: credentials are masked here as in the TUI.
+                let summary = secrets::kept(&tools::summarize_call(&name, &input));
+                if pretty {
+                    before_step!();
+                    eprintln!("{}", runview::step(&who, &name, &summary, width, colour));
+                } else {
+                    eprintln!("{who}> {name} {summary}");
+                }
             }
             Event::ToolEnd { is_error, output, .. } => {
-                let lines = output.lines().count();
-                let more = if lines > 1 { format!(" (+{} lines)", lines - 1) } else { String::new() };
-                eprintln!("{who}  {} {}{more}", if is_error { "!" } else { "=" }, first_line(&output, 160));
+                let output = secrets::kept(&output);
+                if pretty {
+                    eprintln!("{}", runview::outcome(&who, &output, is_error, width, colour));
+                    last = 1;
+                } else {
+                    let lines = output.lines().count();
+                    let more = if lines > 1 { format!(" (+{} lines)", lines - 1) } else { String::new() };
+                    eprintln!("{who}  {} {}{more}", if is_error { "!" } else { "=" }, first_line(&output, 160));
+                }
             }
             Event::Approval { id, tool, summary } => {
                 let decision = if std::io::stdin().is_terminal() {
-                    eprintln!("\n{who}wants to run {tool}:\n{summary}");
-                    eprint!("allow? [y]es / [a]lways / [N]o: ");
+                    if pretty {
+                        before_step!();
+                        let asked = runview::approval(&who, &tool, &secrets::kept(&summary), width, colour);
+                        let (prompt, body) = asked.split_last().expect("an approval always has its prompt");
+                        body.iter().for_each(|line| eprintln!("{line}"));
+                        // The step that follows belongs with the question: no blank line between them.
+                        eprint!("{prompt}");
+                    } else {
+                        eprintln!("\n{who}wants to run {tool}:\n{summary}");
+                        eprint!("allow? [y]es / [a]lways / [N]o: ");
+                    }
                     let answer = tokio::task::spawn_blocking(|| {
                         let mut line = String::new();
                         let _ = std::io::stdin().read_line(&mut line);
@@ -534,7 +611,13 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
                 if level == "error" {
                     failed = true;
                 }
-                eprintln!("{who}[{level}] {text}");
+                if pretty {
+                    before_step!();
+                    let tint = if !colour { "" } else if level == "error" { runview::RED } else { runview::DIM };
+                    eprintln!("  {tint}{who}{} {text}{}", if level == "error" { "✗" } else { "·" }, if colour { runview::RESET } else { "" });
+                } else {
+                    eprintln!("{who}[{level}] {text}");
+                }
             }
             Event::Agent { info } => match info.state.as_str() {
                 "queued" => {}
@@ -560,7 +643,19 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
             _ => {}
         }
     }
-    eprintln!("(session {sid})");
+    if let Some(flow) = &mut flow {
+        write!(out, "{}", flow.finish())?;
+        if !flow.at_line_start() {
+            writeln!(out)?;
+        }
+        out.flush()?;
+    }
+    if pretty {
+        eprintln!("\n{}", runview::footer(&sid, colour));
+    } else {
+        // Scripts read this line for the session's id.
+        eprintln!("(session {sid})");
+    }
     if failed {
         bail!("the run ended with an error");
     }
