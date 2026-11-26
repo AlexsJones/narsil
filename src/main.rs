@@ -18,6 +18,7 @@ mod telemetry;
 mod tools;
 mod tui;
 mod types;
+mod update;
 mod util;
 mod voice;
 mod work;
@@ -37,7 +38,7 @@ use crate::util::{first_line, fmt_age, fmt_tokens};
 /// The version this binary reports. A release is built by GoReleaser from a
 /// git tag, and the tag is the version; a plain `cargo build` falls back to
 /// the one in Cargo.toml.
-const VERSION: &str = match option_env!("NARSIL_VERSION") {
+pub const VERSION: &str = match option_env!("NARSIL_VERSION") {
     Some(tagged) => tagged,
     None => env!("CARGO_PKG_VERSION"),
 };
@@ -67,6 +68,15 @@ enum Cmd {
     Restart,
     /// Show whether the daemon is running and what it is doing
     Status,
+    /// Update narsil the way it was installed (Homebrew, cargo, or a downloaded binary) and restart the daemon
+    Update {
+        /// Say whether there is a newer release, and change nothing
+        #[arg(long)]
+        check: bool,
+        /// Update the program but leave the running daemon as it is
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Run the daemon in the foreground (used by `start` and systemd)
     #[command(hide = true)]
     Daemon,
@@ -357,6 +367,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             service::start(&paths, false).await
         }
         Some(Cmd::Status) => service::status(&paths).await,
+        Some(Cmd::Update { check, no_restart }) => update::update(&paths, update::Opts { check, no_restart }).await,
         Some(Cmd::Daemon) => daemon::run(paths).await,
         Some(Cmd::Run(a)) => cmd_run(&paths, a).await,
         Some(Cmd::Sessions { cmd }) => cmd_sessions(&paths, cmd.unwrap_or(SessionsCmd::List { all: false, limit: 30 })).await,

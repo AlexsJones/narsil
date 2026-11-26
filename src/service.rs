@@ -49,7 +49,7 @@ pub fn outdated(status: &serde_json::Value) -> Option<String> {
     // A daemon started by this very program begins a moment after the file was written.
     (replaced > started + Duration::from_secs(2)).then(|| {
         "narsil has been updated since its daemon started, so the daemon is still the older version. \
-         Run `narsil restart` to use the new one: sessions and work in flight are kept."
+         Run `narsil restart` to use the new one: sessions and work in flight are kept. (`narsil update` does both.)"
             .to_string()
     })
 }

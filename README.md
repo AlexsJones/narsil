@@ -58,7 +58,7 @@ narsil setup                              # choose a backend, store the key, pic
 narsil                                    # open the TUI in the current directory
 ```
 
-Or from source: `cargo install --path .`
+Or from source: `cargo install --path .`. Later, `narsil update` brings it up to date and restarts the daemon.
 
 ```sh
 narsil resume [id]                             # reopen an earlier session, with its history
