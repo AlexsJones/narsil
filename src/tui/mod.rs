@@ -72,7 +72,7 @@ Sessions
                    e errors, w warnings, i info, a all; s this session or all; / find text
   /cleargoal       clear the side panel: drop what is unfinished in this directory's plan (and
                    cancel this session's goal); what was done stays on record
-  /cd <directory>  move this session to another directory: its commands, project memory and
+  /cd <directory>  move this session to another directory (tab completes folder names): its commands, project memory and
                    work plan are then that directory's
   /continue        pick up an interrupted or paused session where it stopped
   /compact         summarize the conversation and start a fresh context
@@ -1293,18 +1293,47 @@ impl App {
         if self.input.cursor != self.input.text.len() || self.completing.is_some() {
             return None;
         }
+        // After `/cd `, the rest of the directory being typed.
+        if let Some(typed) = complete::cd_typed(&self.input.text).filter(|t| !t.is_empty()) {
+            return complete::cd_ghost(typed, std::path::Path::new(&self.here()));
+        }
         complete::ghost(&self.input.text)
+    }
+
+    /// Where this tab is working: the session's directory, or the one the next session will start in.
+    fn here(&self) -> String {
+        self.session.as_ref().map(|s| s.cwd.clone()).unwrap_or_else(|| self.cwd.clone())
     }
 
     /// Complete the command being typed. The first tab takes the best match;
     /// more tabs walk through the others (shift+tab walks back). Returns false
     /// when there is no command being typed, so tab can mean something else.
     fn complete_command(&mut self, backward: bool) -> bool {
+        let at_end = self.input.cursor == self.input.text.len();
         let typed = match &self.completing {
             Some((typed, _)) => typed.clone(),
-            None if complete::typing_command(&self.input.text) && self.input.cursor == self.input.text.len() => self.input.text.clone(),
+            None if at_end && (complete::typing_command(&self.input.text) || complete::cd_typed(&self.input.text).is_some()) => self.input.text.clone(),
             None => return false,
         };
+        // A directory after `/cd `: the same keys, over the folders that fit.
+        if let Some(part) = complete::cd_typed(&typed) {
+            let found = complete::directories(part, std::path::Path::new(&self.here()));
+            if found.is_empty() {
+                self.completing = None;
+                self.flash(if part.is_empty() { "no folders here".to_string() } else { format!("no folder starts with {part}") });
+                return true;
+            }
+            let at = match &self.completing {
+                None => 0,
+                Some((_, at)) if backward => (*at + found.len() - 1) % found.len(),
+                Some((_, at)) => (*at + 1) % found.len(),
+            };
+            self.input.set(format!("/cd {}", found[at]));
+            // With one that fits there is nothing to walk through: the next tab goes on inside it.
+            self.completing = (found.len() > 1).then_some((typed, at));
+            self.dirty = true;
+            return true;
+        }
         let found = complete::matches(&typed);
         if found.is_empty() {
             self.flash(format!("no command starts with {typed}; /help lists them"));
@@ -2708,7 +2737,9 @@ impl App {
         };
         // While a command is being typed, the title lists what fits instead.
         let typed = self.completing.as_ref().map(|(typed, _)| typed.as_str()).unwrap_or(&self.input.text);
-        let (title, color) = match complete::hint(typed, area.width.saturating_sub(6) as usize) {
+        let room = area.width.saturating_sub(6) as usize;
+        let fits = complete::hint(typed, room).or_else(|| complete::cd_typed(typed).and_then(|part| complete::cd_hint(part, std::path::Path::new(&self.here()), room)));
+        let (title, color) = match fits {
             Some(hint) if self.approvals.is_empty() => (format!(" {hint} "), Color::LightBlue),
             _ => (title, color),
         };

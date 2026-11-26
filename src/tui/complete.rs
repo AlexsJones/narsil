@@ -82,6 +82,75 @@ pub fn completed(choice: &Cmd, only: bool) -> String {
     if only && !choice.args.is_empty() { format!("{} ", choice.name) } else { choice.name.to_string() }
 }
 
+/// What has been typed of a directory after `/cd `, if that is what is being typed.
+pub fn cd_typed(text: &str) -> Option<&str> {
+    text.strip_prefix("/cd ").filter(|rest| !rest.contains('\n'))
+}
+
+/// The directories that fit what has been typed after `/cd `, each as the
+/// whole of what would stand there, ending in `/` so that the next tab goes
+/// on inside it. `base` is where a relative path starts from. Hidden folders
+/// are offered only once a dot has been typed.
+pub fn directories(typed: &str, base: &std::path::Path) -> Vec<String> {
+    // `Code/na` is the folder `Code/` and a name starting `na`.
+    let (head, prefix) = match typed.rfind('/') {
+        Some(at) => typed.split_at(at + 1),
+        None => ("", typed),
+    };
+    let folder = match head {
+        "" => base.to_path_buf(),
+        _ => {
+            let written = crate::util::expand_tilde(head);
+            if written.is_absolute() { written } else { base.join(written) }
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(&folder) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .flatten()
+        // A link to a folder is a folder to go into.
+        .filter(|e| std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| prefix.starts_with('.') || !name.starts_with('.'))
+        .collect();
+    // As typed; and only if nothing fits that way, without regard to capitals.
+    let exact: Vec<String> = names.iter().filter(|n| n.starts_with(prefix)).cloned().collect();
+    if exact.is_empty() {
+        let lower = prefix.to_lowercase();
+        names.retain(|n| n.to_lowercase().starts_with(&lower));
+    } else {
+        names = exact;
+    }
+    names.sort_by_key(|n| n.to_lowercase());
+    names.truncate(200);
+    names.into_iter().map(|name| format!("{head}{name}/")).collect()
+}
+
+/// What to show, dimmed, after a directory being typed: the rest of the first that fits.
+pub fn cd_ghost(typed: &str, base: &std::path::Path) -> Option<String> {
+    if typed.is_empty() {
+        return None;
+    }
+    let first = directories(typed, base).into_iter().next()?;
+    // Only when it continues what is there: a match found without regard to capitals does not.
+    first.strip_prefix(typed).filter(|rest| !rest.is_empty()).map(str::to_string)
+}
+
+/// A one-line list of the directories that fit, for above the input.
+pub fn cd_hint(typed: &str, base: &std::path::Path, room: usize) -> Option<String> {
+    let found = directories(typed, base);
+    let name = |full: &str| full.trim_end_matches('/').rsplit('/').next().unwrap_or(full).to_string() + "/";
+    let mut out = format!("tab: {}", name(found.first()?));
+    for other in found.iter().skip(1) {
+        let next = format!(" · {}", name(other));
+        if out.chars().count() + next.chars().count() + 2 > room {
+            out.push_str(" · …");
+            break;
+        }
+        out.push_str(&next);
+    }
+    Some(out)
+}
+
 /// A one-line list of what fits, for above the input: the first with what it
 /// does, the rest by name.
 pub fn hint(typed: &str, room: usize) -> Option<String> {
@@ -143,6 +212,48 @@ mod tests {
         assert_eq!(hint("/go", 80).as_deref(), Some("tab: /goal start a goal here · /goals"));
         assert!(hint("/", 40).unwrap().ends_with(" · …"));
         assert_eq!(hint("/zz", 80), None);
+    }
+
+    #[test]
+    fn directories_complete_after_cd() {
+        let base = std::env::temp_dir().join(format!("narsil-cd-test-{}", std::process::id()));
+        for dir in ["Code/narsil/src", "Code/notes", "Documents", "Downloads", ".config/narsil", "code-old"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("Dockerfile"), "x").unwrap();
+        std::os::unix::fs::symlink(base.join("Code"), base.join("Linked")).unwrap();
+
+        assert_eq!(cd_typed("/cd Co"), Some("Co"));
+        assert_eq!(cd_typed("/cd "), Some(""));
+        assert_eq!((cd_typed("/cd"), cd_typed("/cdx y"), cd_typed("cd x")), (None, None, None));
+
+        // Folders only, as typed, in order; a file of a fitting name is not one, a link to a folder is.
+        assert_eq!(directories("Do", &base), vec!["Documents/", "Downloads/"]);
+        assert_eq!(directories("", &base), vec!["Code/", "code-old/", "Documents/", "Downloads/", "Linked/"], "hidden folders wait for a dot");
+        assert_eq!(directories(".", &base), vec![".config/"]);
+        // Inside a folder, and inside that.
+        assert_eq!(directories("Code/", &base), vec!["Code/narsil/", "Code/notes/"]);
+        assert_eq!(directories("Code/na", &base), vec!["Code/narsil/"]);
+        assert_eq!(directories("Code/narsil/", &base), vec!["Code/narsil/src/"]);
+        assert_eq!(directories("Linked/no", &base), vec!["Linked/notes/"]);
+        // From the top, from above, and from home.
+        assert_eq!(directories(&format!("{}/Doc", base.display()), &base), vec![format!("{}/Documents/", base.display())]);
+        assert_eq!(directories("../Do", &base.join("Code")), vec!["../Documents/", "../Downloads/"]);
+        assert!(directories("~/", &base).iter().all(|d| d.starts_with("~/") && d.ends_with('/')));
+        // Capitals matter when something fits as typed, and not when nothing does.
+        assert_eq!(directories("co", &base), vec!["code-old/"]);
+        assert_eq!(directories("doc", &base), vec!["Documents/"]);
+        assert!(directories("zzz", &base).is_empty() && directories("Nowhere/x", &base).is_empty());
+
+        assert_eq!(cd_ghost("Doc", &base).as_deref(), Some("uments/"));
+        assert_eq!(cd_ghost("Code/na", &base).as_deref(), Some("rsil/"));
+        assert_eq!(cd_ghost("doc", &base), None, "what was found without regard to capitals does not continue what was typed");
+        assert_eq!((cd_ghost("", &base), cd_ghost("zzz", &base), cd_ghost("Documents/", &base)), (None, None, None));
+        assert_eq!(cd_hint("Do", &base, 80).as_deref(), Some("tab: Documents/ · Downloads/"));
+        assert_eq!(cd_hint("Code/", &base, 80).as_deref(), Some("tab: narsil/ · notes/"), "by name, not by the whole path");
+        assert!(cd_hint("", &base, 24).unwrap().ends_with(" · …"));
+        assert_eq!(cd_hint("zzz", &base, 80), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
