@@ -18,12 +18,14 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::field::Empty;
+use tracing::{Instrument, Span};
 
 use crate::config::{Config, Paths, split_model_ref};
 use crate::context;
 use crate::logln;
 use crate::proto::{ApprovalInfo, Envelope, Event, ProviderModels};
-use crate::provider::{self, ChatRequest, Provider, ProviderError, StopReason, StreamEvent};
+use crate::provider::{self, ChatRequest, ChatResponse, Provider, ProviderError, StopReason, StreamEvent};
 use crate::store::{AgentInfo, NewSession, Session, Store, ToolCall};
 use crate::tools::{self, ToolCtx};
 use crate::types::{Block, Message, MsgKind, Role, StoredMessage, blocks_text};
@@ -101,7 +103,87 @@ pub struct Engine {
     runs: Mutex<HashMap<String, RunHandle>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
     always_allow: Mutex<HashSet<(String, String)>>,
+    /// Per session: tool calls made since it last touched the work graph.
+    off_the_books: Mutex<HashMap<String, u32>>,
+    /// Per session: failed tool calls in a row.
+    failing: Mutex<HashMap<String, u32>>,
+    /// Commands that failed in a session and have not yet worked: what kind of command, and its text.
+    stumbles: Mutex<HashMap<String, Vec<(String, String)>>>,
     shutting_down: AtomicBool,
+}
+
+/// The span for one request to a model. One per attempt, so retries show.
+fn call_span(model: &str, provider: &str, attempt: u32, purpose: &str, messages: usize) -> Span {
+    tracing::info_span!(
+        "model_call",
+        what = %model,
+        provider = %provider,
+        attempt,
+        purpose,
+        messages,
+        ttft_ms = Empty,
+        input_tokens = Empty,
+        cache_read = Empty,
+        cache_write = Empty,
+        output_tokens = Empty,
+        stop = Empty,
+        request_id = Empty,
+        message_id = Empty,
+        error = Empty,
+        ok = Empty,
+    )
+}
+
+/// Put what came back on the call's span. `None` means it was cancelled.
+fn record_call(span: &Span, result: Option<&Result<ChatResponse, ProviderError>>, first_token: Option<Duration>) {
+    if let Some(t) = first_token {
+        span.record("ttft_ms", t.as_millis() as u64);
+    }
+    match result {
+        Some(Ok(resp)) => {
+            let u = &resp.usage;
+            span.record("input_tokens", u.input + u.cache_read + u.cache_write)
+                .record("cache_read", u.cache_read)
+                .record("cache_write", u.cache_write)
+                .record("output_tokens", u.output)
+                .record("stop", match &resp.stop {
+                    StopReason::EndTurn => "end_turn",
+                    StopReason::ToolUse => "tool_use",
+                    StopReason::MaxTokens => "max_tokens",
+                    StopReason::Refusal(_) => "refusal",
+                })
+                .record("ok", !matches!(resp.stop, StopReason::Refusal(_)));
+        }
+        Some(Err(e)) => {
+            let class = match e {
+                ProviderError::Retryable { .. } => "retryable",
+                ProviderError::ContextOverflow(_) => "context overflow",
+                ProviderError::ThinkingMismatch(_) => "reasoning rejected",
+                ProviderError::Fatal(_) => "fatal",
+            };
+            span.record("ok", false).record("error", format!("{class}: {e}").as_str());
+        }
+        None => {
+            span.record("ok", false).record("error", "cancelled");
+        }
+    }
+}
+
+/// Makes sure a session is released if its run ends by a panic, so it is not
+/// left looking busy until the daemon restarts.
+struct RunGuard<'a> {
+    engine: &'a Engine,
+    session: &'a Session,
+    armed: bool,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::error!(session = %self.session.id, "the run ended abnormally; releasing the session as interrupted");
+            self.engine.unregister(self.session, "interrupted");
+        }
+    }
 }
 
 fn strip_reasoning(msg: &mut Message) {
@@ -138,6 +220,48 @@ fn render_transcript(stored: &[StoredMessage]) -> String {
     out
 }
 
+/// Commands whose exit status is an answer, not a result: "no match", "not there", "they differ".
+const ASKS_A_QUESTION: [&str; 20] = [
+    "test", "[", "[[", "grep", "egrep", "fgrep", "rg", "diff", "cmp", "which", "type", "ls", "find", "cat", "stat", "pgrep", "pidof", "git diff",
+    "git grep", "head",
+];
+
+/// Whether a shell command that was asked to print its exit status (`...; echo
+/// exit=$?`, a habit of models) printed one other than zero. The line as a
+/// whole then returns success, and the failure would otherwise go unseen.
+fn reports_failure(call: &ToolCall, output: &str) -> bool {
+    static STATUS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?im)\b(?:exit|status|rc|code)\b[^0-9\n]{0,12}([0-9]{1,3})\b").expect("a valid pattern"));
+    call.name == "bash"
+        && call.input.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("$?"))
+        && STATUS.captures_iter(output).any(|c| c[1].parse::<u32>().is_ok_and(|n| n != 0))
+}
+
+/// What a shell command is a run of, for telling two forms of the same thing
+/// apart from two different things: the program, and for programs that are
+/// many tools in one (`cargo`, `make`, `git`), what it was asked to do.
+/// `BUILD_MODE=fast ./build.sh --all` and `cd app && ./build.sh` are both `./build.sh`.
+fn command_kind(command: &str) -> Option<String> {
+    const SETUP: [&str; 6] = ["cd", "export", "set", "source", ".", "echo"];
+    const WRAPPERS: [&str; 5] = ["sudo", "env", "time", "nice", "command"];
+    const MANY_IN_ONE: [&str; 18] =
+        ["cargo", "make", "git", "npm", "pnpm", "yarn", "npx", "go", "docker", "kubectl", "python", "python3", "node", "uv", "pip", "just", "bash", "sh"];
+    // The first step that does something: past any `cd dir &&`, and before any pipe.
+    let step = command.split("&&").flat_map(|s| s.split(';')).map(|s| s.split('|').next().unwrap_or(s).trim()).find(|s| {
+        let first = s.split_whitespace().next().unwrap_or("");
+        !first.is_empty() && !SETUP.contains(&first)
+    })?;
+    let mut words = step.split_whitespace().skip_while(|w| WRAPPERS.contains(w) || (w.contains('=') && !w.starts_with(['-', '/', '.'])));
+    let program = words.next()?;
+    if !MANY_IN_ONE.contains(&program) {
+        return Some(program.to_string());
+    }
+    Some(match words.find(|w| !w.starts_with('-')) {
+        Some(what) => format!("{program} {what}"),
+        None => program.to_string(),
+    })
+}
+
 impl Engine {
     pub fn new(paths: Paths, cfg: Config, store: Store) -> Arc<Engine> {
         let (events, _) = broadcast::channel(8192);
@@ -150,6 +274,9 @@ impl Engine {
             runs: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             always_allow: Mutex::new(HashSet::new()),
+            off_the_books: Mutex::new(HashMap::new()),
+            failing: Mutex::new(HashMap::new()),
+            stumbles: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -339,10 +466,249 @@ impl Engine {
 
     // ---- goals ------------------------------------------------------------
 
+    /// Move a session to another directory (see `Store::switch_directory`).
+    /// `note` puts the change in the transcript; a tool call reports it in its
+    /// own result instead, since nothing may come between a call and its result.
+    pub fn change_directory(&self, sid: &str, path: &str, create: bool, note: bool) -> Result<String> {
+        let session = self.store.require_session(sid)?;
+        let target = tools::resolve(&session.cwd, path.trim());
+        if !target.exists() {
+            if !create {
+                bail!("{} does not exist; pass `create` to make it", target.display());
+            }
+            std::fs::create_dir_all(&target).map_err(|e| anyhow::anyhow!("creating {}: {e}", target.display()))?;
+        }
+        if !target.is_dir() {
+            bail!("{} is not a directory", target.display());
+        }
+        let target = std::fs::canonicalize(&target)?.to_string_lossy().into_owned();
+        if target == session.cwd {
+            return Ok(target);
+        }
+        self.store.switch_directory(sid, &target)?;
+        if let Some(goal) = session.goal_id.as_ref().filter(|_| session.kind == "goal") {
+            // The goal's work, its note and its questions are looked up by its directory.
+            self.store.goal_set_cwd(goal, &target)?;
+        }
+        if note && self.store.message_count(sid)? > 0 {
+            let text = format!("[narsil] The working directory is now {target} (it was {}).", session.cwd);
+            let msg = self.store.append_message(sid, Role::User, MsgKind::Note, &[Block::Text { text }])?;
+            self.emit(&session, Event::Message { msg });
+        }
+        tracing::info!(session = %sid, "working directory is now {target}");
+        self.emit(&session, Event::SessionChanged);
+        Ok(target)
+    }
+
+    /// What memory holds that bears on `text`, leaving out what the session's
+    /// prompt already shows it.
+    pub fn recall(&self, session: &Session, text: &str) -> Vec<crate::store::Memory> {
+        let cfg = self.cfg();
+        crate::memory::refresh(&self.store, &cfg, &self.paths);
+        let scopes = vec!["global".to_string(), context::project_scope(&session.cwd)];
+        let prompt = self.store.get_session(&session.id).ok().flatten().map(|s| s.system_prompt).unwrap_or_default();
+        let have = |title: &str| prompt.contains(&format!("## {title} ["));
+        crate::memory::recall(&self.store, &scopes, text, &have, 5)
+    }
+
+    /// When something new is asked of a session, put what memory holds on the
+    /// subject in front of the agent before it starts: above all, what was
+    /// tried before and failed. Costs a search, not a model call.
+    pub fn recall_note(&self, session: &Session, text: &str) -> Option<StoredMessage> {
+        let from_vault = self.vault_note(session, text);
+        let found = self.recall(session, text);
+        if found.is_empty() {
+            return from_vault;
+        }
+        let titles: Vec<&str> = found.iter().map(|m| m.title.as_str()).collect();
+        let body = format!(
+            "[narsil] Recalled from memory: {}. Read these before starting; do not retry what is marked as tried and \
+             failed unless something has changed since, and say so to the user instead.\n{}",
+            titles.join("; "),
+            crate::memory::recalled_text(&found)
+        );
+        tracing::info!(session = %session.id, "recalled {} memory entries for the new request", found.len());
+        let msg = self.store.append_message(&session.id, Role::User, MsgKind::Note, &[Block::Text { text: body }]).ok()?;
+        self.emit(session, Event::Message { msg: msg.clone() });
+        Some(msg)
+    }
+
+    /// Name the user's own notes on the subject of a new request, so that their
+    /// Obsidian vault is where the agent looks first. A search of the vault,
+    /// not a model call; only the notes' paths are given, and the agent reads
+    /// what it needs.
+    fn vault_note(&self, session: &Session, text: &str) -> Option<StoredMessage> {
+        let cfg = self.cfg();
+        if !cfg.obsidian.lookup {
+            return None;
+        }
+        let notes = crate::obsidian::Vault::open(&cfg)?.lookup(text, 5);
+        if notes.is_empty() {
+            return None;
+        }
+        let body = format!(
+            "[narsil] Obsidian: notes of the user's that may bear on this: {}. For what the user has written down, \
+             their vault is the first place to look: read the relevant ones with vault_read before answering from \
+             general knowledge, searching the web, or asking them.",
+            notes.join("; ")
+        );
+        tracing::info!(session = %session.id, "named {} vault notes for the new request", notes.len());
+        let msg = self.store.append_message(&session.id, Role::User, MsgKind::Note, &[Block::Text { text: body }]).ok()?;
+        self.emit(session, Event::Message { msg: msg.clone() });
+        Some(msg)
+    }
+
+    /// After two failed tool calls in a row, a line asking whether this is a
+    /// dead end worth recording. The moment of failure is when the reason is
+    /// freshest, and when a model left alone tends to just try something else.
+    fn failure_reminder(&self, session: &Session, tool: &str, failed: bool) -> Option<String> {
+        let mut streaks = self.failing.lock().unwrap_or_else(|e| e.into_inner());
+        if !failed || tool.starts_with("work_") || tool.starts_with("memory_") || tool.starts_with("goal_") {
+            if !failed {
+                streaks.remove(&session.id);
+            }
+            return None;
+        }
+        let n = streaks.entry(session.id.clone()).or_insert(0);
+        *n += 1;
+        (*n == 2).then(|| {
+            "\n\n[narsil] Two attempts in a row have failed. If this path is a dead end for a reason that will still hold \
+             next time (the data does not exist, a tool is missing, a service needs a key), record it now with memory_save, \
+             kind dead_end: what you were after, what you tried, why it failed. Then take a different path, or tell the user."
+                .to_string()
+        })
+    }
+
+    /// When a command works where another form of the same command failed, a
+    /// line asking for what made the difference to be written down. A model
+    /// that finds the way through on its second try tends to carry straight
+    /// on, and then has to find it again next time. The very same command
+    /// passing after it failed means something was fixed in between, which
+    /// is ordinary work and gets no reminder.
+    fn lesson_reminder(&self, session: &Session, call: &ToolCall, failed: bool, output: &str) -> Option<String> {
+        let mut all = self.stumbles.lock().unwrap_or_else(|e| e.into_inner());
+        // Writing something down settles what had failed up to now.
+        if matches!(call.name.as_str(), "memory_save" | "work_done" | "goal_blocked" | "goal_complete") && !failed {
+            all.remove(&session.id);
+            return None;
+        }
+        let (kind, command) = match call.name.as_str() {
+            "bash" => {
+                let command = call.input.get("command").and_then(|c| c.as_str())?.trim();
+                (command_kind(command)?, command)
+            }
+            // A page that could not be had: another page from the same site settles it.
+            "web_fetch" => {
+                let url = call.input.get("url").and_then(|u| u.as_str())?.trim();
+                let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url);
+                (format!("web_fetch {host}"), url)
+            }
+            _ => return None,
+        };
+        // A command that answers a question says no with its exit status, and what narsil
+        // itself refused was never tried: neither is a path that failed.
+        if failed && (ASKS_A_QUESTION.contains(&kind.as_str()) || output.starts_with("Refused:")) {
+            return None;
+        }
+        let mine = all.entry(session.id.clone()).or_default();
+        if failed {
+            if !mine.iter().any(|(k, c)| *k == kind && c == command) {
+                mine.push((kind, command.to_string()));
+                if mine.len() > 24 {
+                    mine.remove(0);
+                }
+            }
+            return None;
+        }
+        let earlier: Vec<String> = mine.iter().filter(|(k, _)| *k == kind).map(|(_, c)| c.clone()).collect();
+        mine.retain(|(k, _)| *k != kind);
+        let other = earlier.iter().find(|c| c.as_str() != command)?;
+        if call.name != "bash" {
+            return None;
+        }
+        Some(format!(
+            "\n\n[narsil] This worked where `{}` failed a moment ago. If what made the difference would have to be worked \
+             out again next time (a flag, a variable to set, a step that must come first), record it now with memory_save, \
+             kind lesson: what fails, what works, and why. Scope it to the project unless it holds everywhere.",
+            first_line(other, 100)
+        ))
+    }
+
+    /// When a chat turn is about to end with something having failed and
+    /// nothing written down, the question to put before it ends: is this a
+    /// dead end? One decisive failure is exactly when a model gives up and
+    /// tells the user, and exactly what the next session should not have to
+    /// find out again. Goals and subagents are asked the same thing by the
+    /// tools they finish with.
+    fn unrecorded_failure(&self, session: &Session) -> Option<String> {
+        let left = self.stumbles.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id)?;
+        if session.kind != "chat" {
+            return None;
+        }
+        let (_, command) = left.last()?;
+        Some(format!(
+            "[narsil] Before you finish: `{}` failed in this turn and nothing was recorded. If it failed for a reason that \
+             will still hold next time (the source is gone, a tool or a key is missing, the data does not exist), record it \
+             now with memory_save, kind dead_end: what was wanted, what was tried, and why it failed. If the reason will \
+             not hold (a slip, something since fixed, a passing fault), do nothing more. Either way, do not repeat your answer.",
+            first_line(command, 100)
+        ))
+    }
+
+    /// If a session has work laid out but has gone many tool calls without
+    /// taking or closing anything, a line to add to its next tool result.
+    /// Progress recorded only at the end is no record at all if the run is cut
+    /// short, and shows the user nothing meanwhile.
+    fn work_reminder(&self, session: &Session, tool: &str) -> Option<String> {
+        const EVERY: u32 = 8;
+        let mut counts = self.off_the_books.lock().unwrap_or_else(|e| e.into_inner());
+        if tool.starts_with("work_") || tool == "spawn_agents" || tool.starts_with("goal_") {
+            counts.remove(&session.id);
+            return None;
+        }
+        let n = counts.entry(session.id.clone()).or_insert(0);
+        *n += 1;
+        if *n < EVERY {
+            return None;
+        }
+        *n = 0;
+        drop(counts);
+        let view = crate::work::Overview::of(&self.store, &context::project_dir(&session.cwd)).ok()?;
+        let live: Vec<&crate::work::Item> = view.items.iter().filter(|i| !view.root_of(i).closed() && !i.closed()).collect();
+        let open = live.iter().filter(|i| view.is_ready(i)).count();
+        let held = live.iter().any(|i| i.status == "in_progress" && (i.claimed_by == session.id || self.is_running(&i.claimed_by)));
+        (open > 0 && !held).then(|| {
+            "\n\n[narsil] Work is laid out for this project, but no item is in progress. If you are working on one, take \
+             it with work_next (claim) so progress is visible and survives a restart, and close each finished item with \
+             work_done as you go, not all at the end."
+                .to_string()
+        })
+    }
+
+    /// Tell clients where a project's work stands.
+    pub fn emit_work(&self, project: &str) {
+        if let Ok(items) = crate::work::load(&self.store, Some(project)) {
+            self.emit_global(Event::Work { project: project.to_string(), items });
+        }
+    }
+
+    /// Refresh the goal's note in the Obsidian vault, if that is switched on.
+    pub fn write_goal_note(&self, goal_id: &str) {
+        let cfg = self.cfg();
+        if !cfg.obsidian.goal_notes {
+            return;
+        }
+        let (Some(vault), Ok(Some(goal))) = (crate::obsidian::Vault::open(&cfg), self.store.goal_get(goal_id)) else { return };
+        if let Err(e) = crate::obsidian::write_goal_note(&self.store, &vault, &goal) {
+            tracing::warn!(goal = %goal_id, "could not write the goal's note in the vault: {e:#}");
+        }
+    }
+
     pub fn set_goal_status(&self, id: &str, status: &str, note: &str) -> Result<()> {
         self.store.goal_set_status(id, status, note)?;
+        self.write_goal_note(id);
         if let Some(goal) = self.store.goal_get(id)? {
-            logln!("goal {id} -> {status}{}", if note.is_empty() { String::new() } else { format!(": {}", first_line(note, 200)) });
+            tracing::info!(goal = %id, "goal is now {status}{}", if note.is_empty() { String::new() } else { format!(": {}", first_line(note, 200)) });
             if matches!(status, "completed" | "blocked" | "paused") {
                 self.notify(&format!("Goal {status}: {} ({})", first_line(&goal.objective, 80), first_line(note, 160)));
             }
@@ -400,10 +766,19 @@ impl Engine {
             PendingApproval { info: info.clone(), root: session.root_id.clone(), tx },
         );
         self.emit(session, Event::Approval { id: id.clone(), tool: info.tool, summary: info.summary });
+        // Time spent waiting for a person is its own span, so it is not mistaken for slow work.
+        let waiting = tracing::info_span!("approval_wait", what = %call.name, asked_in = call.message_id, decision = Empty);
         let decision = tokio::select! {
             d = rx => d.ok(),
             _ = cancel.cancelled() => None,
         };
+        waiting.record("decision", match &decision {
+            Some(Decision::Allow) => "allowed",
+            Some(Decision::Always) => "always allowed",
+            Some(Decision::Deny) => "denied",
+            None => "cancelled",
+        });
+        drop(waiting);
         self.approvals.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         self.emit(session, Event::ApprovalDone { id });
         decision
@@ -543,30 +918,88 @@ impl Engine {
         let this = self.clone();
         Box::pin(async move {
             let session = this.store.require_session(&sid)?;
-            let Some(suspend) = this.try_register(&session, &cancel) else {
-                bail!("session {sid} is already running, or narsil is shutting down");
-            };
-            let result = this.run_loop(&session, &cancel, &suspend).await;
-            let state = match &result {
-                Ok(Outcome::Interrupted) if suspend.load(Ordering::SeqCst) => "interrupted",
-                _ => "idle",
-            };
-            if let Err(e) = &result {
-                logln!("session {sid} failed: {e:#}");
-                this.emit(&session, Event::Notice { level: "error".into(), text: format!("{e:#}") });
+            let span = tracing::info_span!(
+                "session_run",
+                session = %session.id,
+                root = %session.root_id,
+                agent = Empty,
+                goal = Empty,
+                what = %session.kind,
+                outcome = Empty,
+                tool_calls = Empty,
+                error = Empty,
+                ok = Empty,
+            );
+            if let Some(agent) = &session.agent_name {
+                span.record("agent", agent.as_str());
             }
-            this.unregister(&session, state);
-            result
+            if let Some(goal) = &session.goal_id {
+                span.record("goal", goal.as_str());
+            }
+            async {
+                let Some(suspend) = this.try_register(&session, &cancel) else {
+                    Span::current().record("ok", false).record("outcome", "not started");
+                    bail!("session {sid} is already running, or narsil is shutting down");
+                };
+                let mut guard = RunGuard { engine: &this, session: &session, armed: true };
+                let result = this.run_loop(&session, &cancel, &suspend).await;
+                guard.armed = false;
+                let suspended = suspend.load(Ordering::SeqCst);
+                let state = match &result {
+                    Ok(Outcome::Interrupted) if suspended => "interrupted",
+                    _ => "idle",
+                };
+                let run = Span::current();
+                match &result {
+                    Ok(Outcome::Completed { tool_calls, .. }) => {
+                        run.record("outcome", "completed").record("tool_calls", *tool_calls as u64);
+                    }
+                    Ok(Outcome::Interrupted) => {
+                        run.record("outcome", if suspended { "suspended, resumable" } else { "interrupted by the user" });
+                    }
+                    Ok(Outcome::Refused(why)) => {
+                        run.record("ok", false).record("outcome", "refused").record("error", why.as_str());
+                    }
+                    Err(e) => {
+                        run.record("ok", false).record("outcome", "failed").record("error", format!("{e:#}").as_str());
+                        tracing::error!(session = %session.id, "session run failed: {e:#}");
+                        this.emit(&session, Event::Notice { level: "error".into(), text: format!("{e:#}") });
+                    }
+                }
+                this.unregister(&session, state);
+                result
+            }
+            .instrument(span)
+            .await
         })
     }
 
     fn deliver_inputs(&self, session: &Session) -> Result<usize> {
         let delivered = self.store.pending_deliver(&session.id)?;
         let n = delivered.len();
+        let mut asked = String::new();
         for msg in delivered {
+            asked.push_str(&blocks_text(&msg.blocks));
+            asked.push('\n');
             self.emit(session, Event::Message { msg });
         }
+        // Subagents are briefed by their parent, which has already been through this.
+        if n > 0 && session.parent_id.is_none() {
+            self.ensure_prompt(session)?;
+            self.recall_note(session, &asked);
+        }
         Ok(n)
+    }
+
+    /// Take the system prompt snapshot for this context epoch, if it has not been taken.
+    fn ensure_prompt(&self, session: &Session) -> Result<String> {
+        let fresh = self.store.require_session(&session.id)?;
+        if !fresh.system_prompt.is_empty() {
+            return Ok(fresh.system_prompt);
+        }
+        let prompt = context::build_system_prompt(&self.cfg(), &self.paths, &self.store, &fresh);
+        self.store.set_system_prompt(&fresh.id, &prompt)?;
+        Ok(prompt)
     }
 
     async fn run_loop(
@@ -579,6 +1012,8 @@ impl Engine {
         let mut tool_calls = 0usize;
         let mut truncations = 0;
         let mut first = true;
+        // What failed in an earlier turn is that turn's business.
+        self.stumbles.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
         loop {
             if cancel.is_cancelled() {
                 return Ok(Outcome::Interrupted);
@@ -619,6 +1054,12 @@ impl Engine {
                 }
                 Tail::Idle => {
                     if self.deliver_inputs(session)? == 0 {
+                        // About to stop with a failure unrecorded: ask, once, whether it is a dead end.
+                        if let Some(question) = self.unrecorded_failure(session) {
+                            let msg = self.store.append_message(sid, Role::User, MsgKind::Note, &[Block::Text { text: question }])?;
+                            self.emit(session, Event::Message { msg });
+                            continue;
+                        }
                         let text = last.map(|m| blocks_text(&m.blocks)).unwrap_or_default();
                         return Ok(Outcome::Completed { text, tool_calls });
                     }
@@ -651,7 +1092,9 @@ impl Engine {
             let resuming = call.status == "running";
             if resuming && !(call.name == "spawn_agents" && call.state.is_some()) {
                 // Journaled as started but never finished: the harness died mid-call.
-                let orphan = call.name == "bash" && call.state.as_ref().is_some_and(tools::shell::kill_orphan);
+                // Stopped just now, or already when the daemon started.
+                let orphan = call.name == "bash"
+                    && call.state.as_ref().is_some_and(|s| s["stopped"] == 1 || tools::shell::kill_orphan(s));
                 let text = if orphan {
                     format!("{CRASHED} The command was still running and has now been stopped.")
                 } else {
@@ -682,7 +1125,34 @@ impl Engine {
             self.store.tool_call_start(sid, call)?;
             self.emit(&session, Event::ToolStart { id: call.id.clone(), name: call.name.clone(), input: call.input.clone() });
             let ctx = ToolCtx { engine: self, session: &session, cancel, call, cfg: &cfg };
-            let out = tools::execute(&ctx).await;
+            let span = tracing::info_span!(
+                "tool_call",
+                what = %call.name,
+                call = %call.id,
+                asked_in = mid,
+                summary = %first_line(&tools::summarize_call(&call.name, &call.input), 160),
+                is_error = Empty,
+                output_bytes = Empty,
+                ok = Empty,
+            );
+            // Run inside the span, so a subagent this call starts is recorded beneath it.
+            let out = tools::execute(&ctx).instrument(span.clone()).await;
+            let mut out = out;
+            if let Some(reminder) = self.work_reminder(&session, &call.name) {
+                out.content.push_str(&reminder);
+            }
+            // For the reminders, a command that printed its own non-zero status failed,
+            // whatever the shell returned for the line as a whole.
+            let failed = out.is_error || reports_failure(&call, &out.content);
+            if let Some(reminder) = self.failure_reminder(&session, &call.name, failed) {
+                out.content.push_str(&reminder);
+            }
+            if let Some(reminder) = self.lesson_reminder(&session, &call, failed, &out.content) {
+                out.content.push_str(&reminder);
+            }
+            span.record("is_error", out.is_error).record("ok", !out.is_error).record("output_bytes", out.content.len() as u64);
+            tracing::debug!(parent: &span, tool = %call.name, is_error = out.is_error, bytes = out.content.len(), "tool call finished");
+            drop(span);
             if cancel.is_cancelled() && suspend.load(Ordering::SeqCst) && call.name == "spawn_agents" {
                 // Left as running: on resume the same children are picked back up.
                 break;
@@ -725,15 +1195,16 @@ impl Engine {
             compacted = true;
         }
         if session.system_prompt.is_empty() {
-            // First call of this session: take the snapshot it will keep for the epoch.
-            let prompt = context::build_system_prompt(&cfg, &self.paths, &self.store, &session);
-            self.store.set_system_prompt(&session.id, &prompt)?;
-            session.system_prompt = prompt;
+            // First call of this session (or after a change of model or directory):
+            // take the snapshot it will keep for the epoch.
+            session.system_prompt = self.ensure_prompt(&session)?;
         }
         let tools = tools::specs(&session, &cfg);
         let retry_forever = session.goal_id.is_some();
         let mut attempt: u32 = 0;
         let mut stripped = false;
+        // The span of the latest request, kept so the reply's message id can be put on it.
+        let mut call: Option<Span>;
 
         let response = loop {
             let result = {
@@ -758,14 +1229,23 @@ impl Engine {
                     thinking: &cfg.model.thinking,
                     strip_thinking: false,
                 };
-                let sink = |ev: StreamEvent| match ev {
-                    StreamEvent::Text(text) => self.emit(&session, Event::TextDelta { text }),
-                    StreamEvent::Thinking(text) => self.emit(&session, Event::ThinkingDelta { text }),
+                let span = call_span(&model_id, &pname, attempt + 1, "turn", messages.len());
+                let started = std::time::Instant::now();
+                let first_token: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+                let sink = |ev: StreamEvent| {
+                    first_token.get_or_init(|| started.elapsed());
+                    match ev {
+                        StreamEvent::Text(text) => self.emit(&session, Event::TextDelta { text }),
+                        StreamEvent::Thinking(text) => self.emit(&session, Event::ThinkingDelta { text }),
+                    }
                 };
-                tokio::select! {
-                    r = provider.chat(&req, &sink) => Some(r),
+                let result = tokio::select! {
+                    r = provider.chat(&req, &sink).instrument(span.clone()) => Some(r),
                     _ = cancel.cancelled() => None,
-                }
+                };
+                record_call(&span, result.as_ref(), first_token.get().copied());
+                call = Some(span);
+                result
             };
             match result {
                 None => {
@@ -783,9 +1263,10 @@ impl Engine {
                     let delay = retry_after.unwrap_or_else(|| Duration::from_secs(1u64 << attempt.min(9))).min(cap);
                     if !delay.is_zero() {
                         let text = format!("{message}; retrying in {}s (attempt {attempt})", delay.as_secs().max(1));
-                        logln!("session {}: {text}", session.id);
+                        tracing::warn!("{text}");
                         self.emit(&session, Event::Notice { level: "warn".into(), text });
                     }
+                    let _waiting = tracing::info_span!("retry_wait", what = "model backend", reason = %first_line(&message, 160), secs = delay.as_secs());
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel.cancelled() => return Ok(Step::Interrupted),
@@ -830,13 +1311,18 @@ impl Engine {
 
         let usage = response.usage.clone();
         logln!(
-            "session {}: model call used {} input tokens ({} read from cache, {} written to it), {} output",
-            session.id,
+            "model call used {} input tokens ({} read from cache, {} written to it), {} output",
             usage.input + usage.cache_read + usage.cache_write,
             usage.cache_read,
             usage.cache_write,
             usage.output
         );
+        // Ties the call to the reply it produced, so a trace can show what the model said.
+        let link = |msg: &StoredMessage| {
+            if let Some(span) = &call {
+                span.record("message_id", msg.id);
+            }
+        };
         let record = |context: i64| {
             let input = usage.input + usage.cache_read + usage.cache_write;
             let _ = self.store.add_usage(&session.id, input, usage.output, context);
@@ -855,6 +1341,7 @@ impl Engine {
                 let why = if detail.is_empty() { String::new() } else { format!(" ({detail})") };
                 let text = format!("[No reply: the model declined this request{why}.]");
                 let msg = self.store.append_assistant(&session.id, &[Block::Text { text }])?;
+                link(&msg);
                 self.emit(&session, Event::Message { msg });
                 record(usage.context_tokens());
                 Ok(Step::Refused(detail))
@@ -864,6 +1351,7 @@ impl Engine {
                 blocks.retain(|b| !matches!(b, Block::ToolUse { .. }));
                 if !blocks.is_empty() {
                     let msg = self.store.append_assistant(&session.id, &blocks)?;
+                    link(&msg);
                     self.emit(&session, Event::Message { msg });
                 } else {
                     self.emit(&session, Event::StreamReset);
@@ -884,6 +1372,7 @@ impl Engine {
                     blocks.push(Block::Text { text: "(no reply)".into() });
                 }
                 let msg = self.store.append_assistant(&session.id, &blocks)?;
+                link(&msg);
                 self.emit(&session, Event::Message { msg });
                 record(usage.context_tokens());
                 Ok(Step::Continue)
@@ -894,6 +1383,11 @@ impl Engine {
     /// Replace the current context with a summary and start a new epoch.
     /// Returns false if cancelled. `overflowed` means the conversation no
     /// longer fits as-is and is summarized from a plain-text rendering.
+    #[tracing::instrument(
+        name = "compaction",
+        skip_all,
+        fields(session = %session.id, root = %session.root_id, what = if overflowed { "context overflow" } else { "over the limit" }, messages = Empty, summary_tokens = Empty, ok = Empty)
+    )]
     pub async fn compact(
         self: &Arc<Self>,
         session: &Session,
@@ -908,6 +1402,7 @@ impl Engine {
         if stored.is_empty() {
             return Ok(true);
         }
+        Span::current().record("messages", stored.len() as u64);
         let last_user_text = stored
             .last()
             .filter(|m| m.role == Role::User && m.kind == MsgKind::Message)
@@ -951,11 +1446,18 @@ impl Engine {
         };
         let sink = |_ev: StreamEvent| {};
         let mut attempt = 0u32;
+        let (pname, _) = split_model_ref(&session.model);
         let response = loop {
+            let span = call_span(model_id, pname, attempt + 1, "compaction", messages.len());
             let result = tokio::select! {
-                r = provider.chat(&req, &sink) => r,
-                _ = cancel.cancelled() => return Ok(false),
+                r = provider.chat(&req, &sink).instrument(span.clone()) => r,
+                _ = cancel.cancelled() => {
+                    record_call(&span, None, None);
+                    return Ok(false);
+                }
             };
+            record_call(&span, Some(&result), None);
+            drop(span);
             match result {
                 Ok(r) => break Some(r),
                 Err(ProviderError::Retryable { message, retry_after }) if attempt < 6 => {
@@ -971,16 +1473,6 @@ impl Engine {
                 Err(e) => bail!("compaction failed: {e}"),
             }
         };
-        if let Some(r) = &response {
-            logln!(
-                "session {}: compaction call used {} input tokens ({} read from cache, {} written to it), {} output",
-                session.id,
-                r.usage.input + r.usage.cache_read + r.usage.cache_write,
-                r.usage.cache_read,
-                r.usage.cache_write,
-                r.usage.output
-            );
-        }
         let summary = response.as_ref().map(|r| blocks_text(&r.blocks)).unwrap_or_default();
         if summary.trim().is_empty() {
             if overflowed {
@@ -998,7 +1490,8 @@ impl Engine {
             let input = r.usage.input + r.usage.cache_read + r.usage.cache_write;
             let _ = self.store.add_usage(&session.id, input, r.usage.output, estimate);
         }
-        logln!("session {} compacted: {} messages -> {} tokens", session.id, stored.len(), estimate);
+        Span::current().record("summary_tokens", estimate);
+        logln!("compacted: {} messages -> {} tokens", stored.len(), estimate);
         self.emit(session, Event::Message { msg });
         Ok(true)
     }
@@ -1029,5 +1522,49 @@ impl Engine {
         }
         self.unregister(&session, "idle");
         result.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_forms_of_one_command_are_told_from_two_commands() {
+        let kind = |c: &str| command_kind(c).unwrap_or_default();
+        assert_eq!(kind("./build.sh"), "./build.sh");
+        assert_eq!(kind("BUILD_MODE=frugal ./build.sh --all"), "./build.sh");
+        assert_eq!(kind("cd app && ./build.sh 2>&1 | tail -5"), "./build.sh");
+        assert_eq!(kind("cargo test --release"), "cargo test");
+        assert_eq!(kind("cargo build"), "cargo build");
+        assert_eq!(kind("sudo make install"), "make install");
+        assert_eq!(kind("python3 -u scripts/load.py --dry-run"), "python3 scripts/load.py");
+        assert_eq!(kind("ls -la; echo ---; cat fetch.sh"), "ls");
+        assert_eq!(kind("export A=1; cd x"), "");
+        assert_eq!(kind("./build.sh; echo exit=$?"), "./build.sh");
+    }
+
+    #[test]
+    fn a_command_that_prints_its_own_failure_has_failed() {
+        let said = |command: &str, output: &str| {
+            let call = ToolCall {
+                id: "c".into(),
+                message_id: 1,
+                seq: 0,
+                name: "bash".into(),
+                input: serde_json::json!({ "command": command }),
+                status: "done".into(),
+                state: None,
+                result: None,
+                is_error: false,
+            };
+            reports_failure(&call, output)
+        };
+        assert!(said("./build.sh; echo exit=$?", "exit=37\n[stderr]\nbuild failed"));
+        assert!(said("make test; echo \"exit code: $?\"", "FAIL\nexit code: 2"));
+        assert!(said("./run; echo \"status $?\"", "status 1"));
+        assert!(!said("./build.sh; echo exit=$?", "build ok: 14 targets\nexit=0"));
+        assert!(!said("cat build.sh", "if x; then exit 37; fi"), "a script that mentions an exit status was not asked for its own");
+        assert!(!said("./build.sh", "exit=37"), "only a command that asked for the status");
     }
 }

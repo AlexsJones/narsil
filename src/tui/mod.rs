@@ -1,7 +1,9 @@
 //! The terminal UI: a client of the daemon. Closing it never stops any work;
 //! reopening it shows the session exactly as the daemon has it.
 
+mod complete;
 mod input;
+mod keys;
 mod models;
 mod render;
 
@@ -25,13 +27,15 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use self::input::InputBox;
+use self::keys::{Action, KeyMap};
 use self::models::{Picker, Target};
 use self::render::{Entry, Item, SPINNER, agent_label, agent_mark, agent_status, markdown, wrap};
 use crate::client::Conn;
 use crate::config::{Config, Paths};
 use crate::context;
 use crate::proto::{ApprovalInfo, Command, Envelope, Event, ProviderModels};
-use crate::store::{AgentInfo, Goal, Objective, Session, Store};
+use crate::store::{AgentInfo, Goal, Session, Store};
+use crate::work::{Item as WorkItem, Overview};
 use crate::types::{Block, MsgKind, Role, StoredMessage};
 use crate::util::{first_line, fmt_age, fmt_duration, fmt_tokens, home, now};
 use crate::voice;
@@ -44,19 +48,28 @@ pub struct Opts {
 }
 
 const HELP: &str = "\
-Keys
+Keys (f1 or /keys lists all of them as they are bound now; [keys] in config.toml rebinds them)
   enter            send                    alt+enter / ctrl+j   new line
   esc              interrupt the agent     ctrl+c               clear input, then quit
   pgup / pgdn      scroll                  up / down            input history
-  ctrl+o           expand tool output      ctrl+t               show or hide thinking
-  F2               voice input             ctrl+d               quit (work continues)
-  tab              focus the side panel: up/down jumps the conversation to each objective,
-                   subagent or milestone; enter opens a subagent; esc returns to the live
-                   end (/panel hides it)
+  ctrl+o           expand tool output      alt+t                show or hide thinking
+  f2               voice input             ctrl+d               quit (work continues)
+  tab              complete a command being typed; otherwise focus the side panel: up/down
+                   jumps the conversation to where each work item, subagent or milestone
+                   was last touched; enter opens a subagent; esc returns to the live end
+
+Tabs (each tab is a session of its own; they all keep working at once)
+  ctrl+t           new tab                 alt+w                close this tab
+  alt+right/left   next / previous tab     ctrl+g then 1 … 9    go to that tab
+  After ctrl+g, left/right, t and w also work, for terminals that keep the alt keys for themselves.
+  A tab shows a spinner while it works, ! when it wants an approval, and • when it has finished
+  since you last looked.
 
 Sessions
   /new             start a fresh session   /sessions            pick a session to resume
   /resume <id>     open a session by id    /title <text>        rename this session
+  /cd <directory>  move this session to another directory: its commands, project memory and
+                   work plan are then that directory's
   /continue        pick up an interrupted or paused session where it stopped
   /compact         summarize the conversation and start a fresh context
 
@@ -64,14 +77,23 @@ Goals (the agent keeps working until done, with or without this window)
   /goal <text>     start a goal here       /goals               list goals
   /pause           pause this goal         /continue            resume it
 
+Work (the plan: items that depend on each other, kept as notes you can edit)
+  The side panel shows it: ✓ done  ▶ in progress  ○ ready  · blocked  ? waiting on you.
+  It survives compaction, restarts and new sessions; narsil work prints it outside the TUI.
+
 Subagents (the agent spawns them for independent pieces of work)
-  They appear live in the conversation and in the side panel, under the objective each serves.
+  They appear live in the conversation and in the side panel, under the work item each holds.
   /agents          list them; enter opens one    /back or esc         return from a subagent
   /pause           while viewing a subagent, stops just that one
 
-Memory
+Obsidian (when a vault is set under [obsidian] in config.toml)
+  ◈ in purple marks everything that touches your vault: a search or read of your notes, a file
+  tool or command that reaches into it, and the notes narsil names when you ask for something.
+  The status line shows ◈ vault, how many parts of it you have closed, and when it is away.
+
+Memory (a folder of linked Markdown notes; edit them in any editor, or in Obsidian)
   /memory [query]  list or search          /remember <text>     save a global memory
-  /forget <id>     delete a memory
+  /forget <id>     delete a memory and its note
 
 Models
   /model           pick a model from every configured provider: type to filter, enter selects,
@@ -79,11 +101,19 @@ Models
   /model <text>    the same, already filtered; a full provider/model-id switches at once
   /provider [name] list the providers, or one provider's models (add providers: narsil setup)
 
+Seeing what it did
+  /trace           the tree that was walked: each decision the model made, the tools it then
+                   ran and what came back, subagents under the call that started them, timings
+  /stats           where the time and tokens went, per model and per tool
+                   (outside the TUI: narsil trace [id] --flamegraph out.svg, narsil stats)
+
 Settings
   /auto  /ask      permission mode         /reload              re-read config.toml
   /quit
 
-Typing while the agent works queues your message; it is delivered at the next step.";
+Typing while the agent works queues your message; it is delivered at the next step.
+Commands complete as you type: the rest of the best match shows dimmed, tab or right takes it,
+and more tabs walk through the others.";
 
 enum Overlay {
     None,
@@ -134,9 +164,14 @@ struct App {
     cwd: String,
     session: Option<Session>,
     goal: Option<Goal>,
-    objectives: Vec<Objective>,
-    /// Goal milestones found in the transcript: (text, message id).
-    milestones: Vec<(String, i64)>,
+    /// The work items of the project on screen.
+    work: Overview,
+    /// Where in this session's transcript each item was last touched.
+    work_anchors: std::collections::HashMap<String, i64>,
+    /// The session that last did something to each item.
+    work_owners: std::collections::HashMap<String, String>,
+    /// Goal milestones found in the transcript: (text, message id, the call that recorded it).
+    milestones: Vec<(String, i64, String)>,
     /// Every subagent in this session tree, in creation order.
     agents: Vec<AgentInfo>,
     /// When a subagent was opened from a scrolled-back view: the spawn call to return to.
@@ -162,6 +197,9 @@ struct App {
     expanded: bool,
     show_thinking: bool,
     spin: usize,
+    /// Time to draw the last frame and the slowest one, in milliseconds.
+    frame_ms: (u64, u64),
+    last_width: u16,
     dirty: bool,
     quit: bool,
     flash: Option<(String, Instant)>,
@@ -172,56 +210,377 @@ struct App {
     pending_mode: Option<String>,
     /// Model chosen with /model before the session exists.
     pending_model: Option<String>,
+    /// While tab is cycling through commands: what was typed, and which match is shown.
+    completing: Option<(String, usize)>,
+    /// An open /trace or /stats: which, when it was last read, and whether it follows the latest steps.
+    live_view: Option<(&'static str, Instant, bool)>,
+    /// The Obsidian vault: None when none is set, else whether it can be reached, and when that was last checked.
+    vault: Option<(bool, Instant)>,
     bg_tx: mpsc::UnboundedSender<Bg>,
+    /// The key bindings in force, shared by every tab.
+    keys: Arc<KeyMap>,
+    /// Set by /keys: the window opens the list of keys.
+    want_keys: bool,
+    /// Its run ended while another tab was in front.
+    unseen: bool,
+}
+
+/// What a tab's background work reports back, tagged with the tab it belongs to.
+type Tagged<T> = (u64, T);
+
+/// The window: one or more tabs, each a session of its own with its own
+/// connection to the daemon, and what belongs to the window rather than to a
+/// tab (the tab bar, the keys window).
+struct Tabs {
+    tabs: Vec<(u64, App)>,
+    active: usize,
+    next_id: u64,
+    keys: Arc<KeyMap>,
+    /// The keys window, with how far it is scrolled, when it is open.
+    keys_window: Option<usize>,
+    /// Set by the "go to tab" key: the next key says which tab, or what to do with tabs.
+    going: Option<Instant>,
+    paths: Paths,
+    cfg: Config,
+    store: Store,
+    /// Events from every tab's connection. None: that connection was lost.
+    push_tx: mpsc::UnboundedSender<Tagged<Option<Envelope>>>,
+    bg_tx: mpsc::UnboundedSender<Tagged<Bg>>,
+    dirty: bool,
+}
+
+impl Tabs {
+    /// Open a tab on a fresh connection, in `cwd`. Returns its index.
+    async fn open(&mut self, cwd: String) -> Result<usize> {
+        let mut conn = Conn::connect_or_start(&self.paths).await?;
+        let mut pushes = conn.take_events();
+        let id = self.next_id;
+        self.next_id += 1;
+        let all = self.push_tx.clone();
+        tokio::spawn(async move {
+            while let Some(env) = pushes.recv().await {
+                if all.send((id, Some(env))).is_err() {
+                    return;
+                }
+            }
+            let _ = all.send((id, None));
+        });
+        let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<Bg>();
+        let all = self.bg_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = bg_rx.recv().await {
+                if all.send((id, msg)).is_err() {
+                    return;
+                }
+            }
+        });
+        let app = App::new(self.paths.clone(), self.cfg.clone(), self.store.clone(), cwd, conn, bg_tx, self.keys.clone());
+        self.tabs.push((id, app));
+        self.dirty = true;
+        Ok(self.tabs.len() - 1)
+    }
+
+    fn app(&mut self) -> &mut App {
+        &mut self.tabs[self.active].1
+    }
+
+    fn go_to(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active = index;
+            let app = self.app();
+            app.unseen = false;
+            app.dirty = true;
+            self.dirty = true;
+        }
+    }
+
+    /// Go to a tab by its number in the bar (0 for the first), or say there is no such tab.
+    fn go_to_number(&mut self, n: usize) {
+        if n < self.tabs.len() {
+            self.go_to(n);
+        } else {
+            let label = self.keys.label(Action::NewTab);
+            self.app().flash(format!("there is no tab {}; {label} opens one", n + 1));
+        }
+    }
+
+    /// Open a tab and bring it to the front. It starts where the tab in front is working.
+    async fn new_tab(&mut self) {
+        let cwd = self.app().session.as_ref().map(|s| s.cwd.clone()).unwrap_or_else(|| self.app().cwd.clone());
+        match self.open(cwd).await {
+            Ok(index) => self.go_to(index),
+            Err(e) => self.app().error(format!("could not open a tab: {e:#}")),
+        }
+    }
+
+    fn close_tab(&mut self) {
+        if !self.close() {
+            let quit = self.keys.label(Action::Quit);
+            self.app().flash(format!("this is the only tab; {quit} leaves narsil"));
+        }
+    }
+
+    /// Close the tab in front. Whatever its session is doing carries on in the
+    /// daemon. Returns false when it was the last one.
+    fn close(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let (_, closed) = self.tabs.remove(self.active);
+        let left = closed.session.as_ref().map(|s| {
+            let working = if closed.run_state == "running" { ", still working" } else { "" };
+            format!("closed {}{working}: /resume {} reopens it", first_line(&s.title, 30), s.id)
+        });
+        self.active = self.active.min(self.tabs.len() - 1);
+        self.go_to(self.active);
+        if let Some(text) = left {
+            self.app().flash(text);
+        }
+        true
+    }
+
+    async fn on_term(&mut self, ev: TermEvent) {
+        if let TermEvent::Key(key) = &ev {
+            if key.kind == KeyEventKind::Release {
+                return;
+            }
+            self.dirty = true;
+            if let Some(scroll) = &mut self.keys_window {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *scroll += 10,
+                    _ => self.keys_window = None,
+                }
+                return;
+            }
+            if self.going.take().is_some() {
+                // The key after "go to tab". Plain keys, so no terminal can have taken them.
+                let app = self.app();
+                app.flash = None;
+                app.dirty = true;
+                match key.code {
+                    KeyCode::Char(c @ '1'..='9') => self.go_to_number(c as usize - '1' as usize),
+                    KeyCode::Right | KeyCode::Char('n') => self.go_to((self.active + 1) % self.tabs.len()),
+                    KeyCode::Left | KeyCode::Char('p') => self.go_to((self.active + self.tabs.len() - 1) % self.tabs.len()),
+                    KeyCode::Char('t') => self.new_tab().await,
+                    KeyCode::Char('w') => self.close_tab(),
+                    // Anything else calls it off.
+                    _ => {}
+                }
+                return;
+            }
+            if let Some(n) = self.keys.tab_number(key) {
+                self.go_to_number(n);
+                return;
+            }
+            match self.keys.action(key) {
+                Some(Action::GotoTab) => {
+                    self.going = Some(Instant::now());
+                    self.app().flash("go to tab: 1–9 · ←/→ previous/next · t new · w close · any other key cancels");
+                    return;
+                }
+                Some(Action::NewTab) => return self.new_tab().await,
+                Some(Action::CloseTab) => return self.close_tab(),
+                Some(Action::NextTab) => return self.go_to((self.active + 1) % self.tabs.len()),
+                Some(Action::PrevTab) => return self.go_to((self.active + self.tabs.len() - 1) % self.tabs.len()),
+                Some(Action::Keys) => {
+                    self.keys_window = Some(0);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.app().on_term(ev).await;
+        if std::mem::take(&mut self.app().want_keys) {
+            self.keys_window = Some(0);
+            self.dirty = true;
+        }
+    }
+
+    async fn run_loop(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        mut pushes: mpsc::UnboundedReceiver<Tagged<Option<Envelope>>>,
+        mut background: mpsc::UnboundedReceiver<Tagged<Bg>>,
+    ) -> Result<()> {
+        let mut term_events = EventStream::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            if self.dirty || self.app().dirty {
+                let started = Instant::now();
+                terminal.draw(|f| self.draw(f))?;
+                self.dirty = false;
+                let width = terminal.size().map(|s| s.width).ok();
+                let app = self.app();
+                app.dirty = false;
+                let ms = started.elapsed().as_millis() as u64;
+                app.frame_ms = (ms, app.frame_ms.1.max(ms));
+                app.last_width = width.unwrap_or(app.last_width);
+                if ms > 50 {
+                    // A slow frame makes typing feel laggy; worth knowing which view caused it.
+                    tracing::warn!(session = app.session.as_ref().map(|s| s.id.as_str()).unwrap_or(""), ms, entries = app.entries.len(), "slow frame");
+                }
+            }
+            tokio::select! {
+                ev = term_events.next() => match ev {
+                    Some(Ok(ev)) => self.on_term(ev).await,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                },
+                Some((id, env)) = pushes.recv() => {
+                    let mut next = Some((id, env));
+                    while let Some((id, env)) = next {
+                        let front = self.tabs[self.active].0;
+                        match (self.tabs.iter_mut().find(|(tab, _)| *tab == id), env) {
+                            (Some((_, app)), Some(env)) => {
+                                let was = app.run_state.clone();
+                                app.on_push(env);
+                                // A run that ends behind another tab leaves a mark on its tab.
+                                if id != front && was == "running" && app.run_state != "running" {
+                                    app.unseen = true;
+                                }
+                            }
+                            (Some(_), None) => bail!("lost the connection to the narsil daemon (sessions are safe; reopen with `narsil -c`)"),
+                            // A tab that has been closed.
+                            (None, _) => {}
+                        }
+                        // What happens in any tab can change the tab bar.
+                        self.dirty = true;
+                        next = pushes.try_recv().ok();
+                    }
+                }
+                Some((id, msg)) = background.recv() => {
+                    if let Some((_, app)) = self.tabs.iter_mut().find(|(tab, _)| *tab == id) {
+                        app.on_background(msg).await;
+                    }
+                    self.dirty = true;
+                }
+                _ = tick.tick() => {
+                    for (_, app) in &mut self.tabs {
+                        app.on_tick();
+                    }
+                    // "Go to tab" does not wait for ever: its hint is gone after a few seconds.
+                    if self.going.is_some_and(|at| at.elapsed() > Duration::from_secs(4)) {
+                        self.going = None;
+                        let app = self.app();
+                        app.flash = None;
+                        app.dirty = true;
+                    }
+                    // A spinner in the tab bar, for work going on behind the tab in front.
+                    if self.tabs.len() > 1 && self.tabs.iter().any(|(_, a)| a.run_state == "running") {
+                        self.dirty = true;
+                    }
+                }
+            }
+            if self.app().quit {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw(&mut self, f: &mut Frame) {
+        let area = f.area();
+        let below = if self.tabs.len() > 1 {
+            let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(area);
+            self.draw_bar(f, bar);
+            rest
+        } else {
+            area
+        };
+        self.app().draw(f, below);
+        if let Some(scroll) = self.keys_window {
+            let lines = self.keys.listing();
+            let w = area.width.saturating_sub(6).clamp(20, 104).min(area.width);
+            let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2)).max(5).min(area.height);
+            let rect = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+            let block = UiBlock::bordered()
+                .border_style(Style::new().fg(Color::LightBlue))
+                .title(" keys ")
+                .title_bottom(" up/down scroll · any other key closes · rebind under [keys] in config.toml ");
+            let room = block.inner(rect).height as usize;
+            let scroll = scroll.min(lines.len().saturating_sub(room));
+            self.keys_window = Some(scroll);
+            let heading = Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD);
+            let shown: Vec<Line> = lines
+                .iter()
+                .skip(scroll)
+                .take(room)
+                // Section names are the short lines that start at the margin.
+                .map(|l| if !l.starts_with(' ') && !l.is_empty() && l.len() < 20 { Line::styled(format!(" {l}"), heading) } else { Line::raw(format!(" {l}")) })
+                .collect();
+            f.render_widget(Clear, rect);
+            f.render_widget(Paragraph::new(shown).block(block), rect);
+        }
+    }
+
+    /// One line of tabs: number, title, and a mark for what needs knowing
+    /// about a tab that is not in front.
+    fn draw_bar(&self, f: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
+        let each = (area.width as usize / self.tabs.len().max(1)).clamp(10, 28);
+        for (i, (_, app)) in self.tabs.iter().enumerate() {
+            let title = match &app.session {
+                Some(s) if !s.title.is_empty() => s.title.clone(),
+                Some(_) => "untitled".to_string(),
+                None => "new".to_string(),
+            };
+            let mark = if !app.approvals.is_empty() {
+                " !".to_string()
+            } else if app.run_state == "running" {
+                format!(" {}", SPINNER[app.spin % SPINNER.len()])
+            } else if app.unseen {
+                " •".to_string()
+            } else {
+                String::new()
+            };
+            let label = format!(" {} {}{mark} ", i + 1, first_line(&title, each.saturating_sub(6)));
+            let style = if i == self.active {
+                Style::new().fg(Color::Black).bg(Color::LightBlue).add_modifier(Modifier::BOLD)
+            } else if !app.approvals.is_empty() {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::styled("│", Style::new().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!(
+                " {} then 1–9 · {} new · {} keys",
+                self.keys.label(Action::GotoTab),
+                self.keys.label(Action::NewTab),
+                self.keys.label(Action::Keys)
+            ),
+            Style::new().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 }
 
 pub async fn run(paths: Paths, cfg: Config, opts: Opts) -> Result<()> {
-    let mut conn = Conn::connect_or_start(&paths).await?;
-    let pushes = conn.take_events();
     let store = Store::open(&paths.db_file())?;
-    let history = store.history_recent(500).unwrap_or_default();
-    let (bg_tx, bg_rx) = mpsc::unbounded_channel();
-    let mut app = App {
-        show_thinking: cfg.tui.show_thinking,
+    let keys = Arc::new(KeyMap::from_config(&cfg.keys));
+    let (push_tx, pushes) = mpsc::unbounded_channel();
+    let (bg_tx, background) = mpsc::unbounded_channel();
+    let mut tabs = Tabs {
+        tabs: Vec::new(),
+        active: 0,
+        next_id: 1,
+        keys: keys.clone(),
+        keys_window: None,
+        going: None,
         paths,
         cfg,
-        conn: Arc::new(conn),
         store,
-        cwd: opts.cwd.clone(),
-        session: None,
-        goal: None,
-        objectives: Vec::new(),
-        milestones: Vec::new(),
-        agents: Vec::new(),
-        back_to: None,
-        panel_visible: false,
-        panel_hidden: false,
-        panel_focus: false,
-        panel_sel: 0,
-        jump: None,
-        cur_msg: 0,
-        entries: Vec::new(),
-        last_msg_id: 0,
-        stream: String::new(),
-        stream_thinking: String::new(),
-        input: InputBox::new(history),
-        scroll: 0,
-        view_h: 20,
-        run_state: "idle".into(),
-        overlay: Overlay::None,
-        approvals: VecDeque::new(),
-        expanded: false,
-        spin: 0,
-        dirty: true,
-        quit: false,
-        flash: None,
-        last_ctrl_c: None,
-        recorder: None,
-        transcribing: false,
-        pending_mode: None,
-        pending_model: None,
+        push_tx,
         bg_tx,
+        dirty: true,
     };
+    tabs.open(opts.cwd.clone()).await?;
+    let app = tabs.app();
     // Resolve the starting session before taking over the terminal, so that
     // a bad id is an ordinary error message.
     if let Some(id) = &opts.session {
@@ -235,68 +594,121 @@ pub async fn run(paths: Paths, cfg: Config, opts: Opts) -> Result<()> {
     } else if opts.pick {
         app.open_sessions();
     }
+    if let Some(problem) = keys.problems.first() {
+        app.flash(problem.clone());
+    }
+    if let Some(inner) = crate::obsidian::Vault::open(&app.cfg).and_then(|v| v.vault_inside()) {
+        app.note(format!(
+            "obsidian: [obsidian] vault names the folder above your vault; the vault itself is {}. `narsil doctor` says more.",
+            inner.display()
+        ));
+    }
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    if app.cfg.tui.mouse {
+    if tabs.cfg.tui.mouse {
         let _ = execute!(std::io::stdout(), EnableMouseCapture);
     }
-    let result = app.event_loop(&mut terminal, pushes, bg_rx).await;
+    let result = tabs.run_loop(&mut terminal, pushes, background).await;
     let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    if let Some(s) = &app.session {
-        let working = if app.run_state == "running" { " (still working in the background)" } else { "" };
-        println!("session {}{working}: narsil resume {}", s.id, s.id);
+    for (_, app) in &tabs.tabs {
+        if let Some(s) = &app.session {
+            let working = if app.run_state == "running" { " (still working in the background)" } else { "" };
+            println!("session {}{working}: narsil resume {}", s.id, s.id);
+        }
     }
     result
 }
 
 impl App {
-    async fn event_loop(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-        mut pushes: mpsc::UnboundedReceiver<Envelope>,
-        mut bg_rx: mpsc::UnboundedReceiver<Bg>,
-    ) -> Result<()> {
-        let mut term_events = EventStream::new();
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            if self.dirty {
-                terminal.draw(|f| self.draw(f))?;
-                self.dirty = false;
-            }
-            tokio::select! {
-                ev = term_events.next() => match ev {
-                    Some(Ok(ev)) => self.on_term(ev).await,
-                    Some(Err(e)) => return Err(e.into()),
-                    None => break,
-                },
-                env = pushes.recv() => match env {
-                    Some(env) => {
-                        self.on_push(env);
-                        while let Ok(more) = pushes.try_recv() {
-                            self.on_push(more);
-                        }
-                    }
-                    None => bail!("lost the connection to the narsil daemon (sessions are safe; reopen with `narsil -c`)"),
-                },
-                Some(msg) = bg_rx.recv() => self.on_background(msg).await,
-                _ = tick.tick() => {
-                    if self.busy() {
-                        self.spin += 1;
-                        self.dirty = true;
-                    }
-                    if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5)) {
-                        self.flash = None;
-                        self.dirty = true;
-                    }
-                }
-            }
-            if self.quit {
-                break;
-            }
+    fn new(paths: Paths, cfg: Config, store: Store, cwd: String, conn: Conn, bg_tx: mpsc::UnboundedSender<Bg>, keys: Arc<KeyMap>) -> App {
+        let history = store.history_recent(500).unwrap_or_default();
+        let mut app = App {
+            show_thinking: cfg.tui.show_thinking,
+            paths,
+            cfg,
+            conn: Arc::new(conn),
+            store,
+            cwd,
+            session: None,
+            goal: None,
+            work: Overview { items: Vec::new() },
+            work_anchors: Default::default(),
+            work_owners: Default::default(),
+            milestones: Vec::new(),
+            agents: Vec::new(),
+            back_to: None,
+            panel_visible: false,
+            panel_hidden: false,
+            panel_focus: false,
+            panel_sel: 0,
+            jump: None,
+            cur_msg: 0,
+            entries: Vec::new(),
+            last_msg_id: 0,
+            stream: String::new(),
+            stream_thinking: String::new(),
+            input: InputBox::new(history),
+            scroll: 0,
+            view_h: 20,
+            run_state: "idle".into(),
+            overlay: Overlay::None,
+            approvals: VecDeque::new(),
+            expanded: false,
+            spin: 0,
+            frame_ms: (0, 0),
+            last_width: 120,
+            dirty: true,
+            quit: false,
+            flash: None,
+            last_ctrl_c: None,
+            recorder: None,
+            transcribing: false,
+            pending_mode: None,
+            pending_model: None,
+            completing: None,
+            live_view: None,
+            vault: None,
+            bg_tx,
+            keys,
+            want_keys: false,
+            unseen: false,
+        };
+        app.check_vault();
+        // Work still unfinished in this directory shows at once, before any session is open.
+        let here = crate::work::load(&app.store, Some(&app.project())).unwrap_or_default();
+        app.set_work(here);
+        app
+    }
+
+    /// See whether the Obsidian vault is there, for the status line and for
+    /// marking what touches it.
+    fn check_vault(&mut self) {
+        let set = self.cfg.obsidian.vault.trim();
+        let was = self.vault.map(|(there, _)| there);
+        self.vault = (!set.is_empty()).then(|| (crate::obsidian::Vault::present(&crate::util::expand_tilde(set)), Instant::now()));
+        render::set_vault(&if set.is_empty() { String::new() } else { crate::util::expand_tilde(set).to_string_lossy().into_owned() });
+        if was != self.vault.map(|(there, _)| there) {
+            self.dirty = true;
         }
-        Ok(())
+    }
+
+    /// Ten times a second: spinners, messages that time out, views that follow a run.
+    fn on_tick(&mut self) {
+        // A vault on a drive that comes and goes: look again now and then.
+        if self.vault.is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(15)) {
+            self.check_vault();
+        }
+        if self.busy() {
+            self.spin += 1;
+            self.dirty = true;
+        }
+        if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5)) {
+            self.flash = None;
+            self.dirty = true;
+        }
+        self.refresh_live_view();
     }
 
     fn busy(&self) -> bool {
@@ -351,6 +763,10 @@ impl App {
                     match b {
                         Block::Text { text } => self.push(Item::User { text: text.clone() }),
                         Block::ToolResult { tool_use_id, content, is_error } => {
+                            if *is_error {
+                                // The call was refused (a goal declared complete with work still open, say).
+                                self.milestones.retain(|(_, _, call)| call != tool_use_id);
+                            }
                             if let Some(e) = self.tool_entry(tool_use_id) {
                                 if let Item::Tool { output, is_error: err, running, .. } = &mut e.item {
                                     if output.is_none() {
@@ -376,9 +792,9 @@ impl App {
                         Block::ToolUse { id, name, input, .. } => {
                             let field = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
                             match name.as_str() {
-                                "goal_update" => self.milestones.push((field("note"), m.id)),
-                                "goal_complete" => self.milestones.push((format!("completed: {}", field("summary")), m.id)),
-                                "goal_blocked" => self.milestones.push((format!("blocked: {}", field("reason")), m.id)),
+                                "goal_update" => self.milestones.push((field("note"), m.id, id.clone())),
+                                "goal_complete" => self.milestones.push((format!("completed: {}", field("summary")), m.id, id.clone())),
+                                "goal_blocked" => self.milestones.push((format!("blocked: {}", field("reason")), m.id, id.clone())),
                                 _ => {}
                             }
                             if self.tool_entry(id).is_none() {
@@ -417,7 +833,7 @@ impl App {
         self.milestones.clear();
         self.panel_focus = false;
         self.panel_sel = 0;
-        self.objectives = serde_json::from_value(v["objectives"].clone()).unwrap_or_default();
+        let work: Vec<WorkItem> = serde_json::from_value(v["work"].clone()).unwrap_or_default();
         self.agents = serde_json::from_value(v["agents"].clone()).unwrap_or_default();
         for m in &messages {
             self.push_message(m);
@@ -454,6 +870,7 @@ impl App {
             }
         }
         self.session = Some(session);
+        self.set_work(work);
         self.overlay = Overlay::None;
         self.dirty = true;
         Ok(())
@@ -573,6 +990,11 @@ impl App {
                     }
                 }
                 Event::Notice { text, .. } => self.flash(text),
+                Event::Work { project, items } => {
+                    if project == self.project() {
+                        self.set_work(items);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -657,7 +1079,8 @@ impl App {
                 self.approvals.push_back(ApprovalInfo { id, session: env.session, agent: env.agent, tool, summary });
             }
             Event::ApprovalDone { id } => self.approvals.retain(|a| a.id != id),
-            Event::Objectives { items } => self.objectives = items,
+            // Work is announced to everyone, not per session; see the top of this function.
+            Event::Work { .. } => {}
             Event::Agent { info } => self.agent_update(*info),
             Event::Notice { level, text } => {
                 if level == "error" {
@@ -782,6 +1205,101 @@ impl App {
             let result = conn.call(cmd).await.map_err(|e| format!("{e:#}"));
             let _ = tx.send(Bg::Done { label, result });
         });
+    }
+
+    /// Keep an open /trace or /stats current, about once a second while the session works.
+    fn refresh_live_view(&mut self) {
+        let Some((cmd, at, follow)) = self.live_view else { return };
+        if !matches!(self.overlay, Overlay::Text { .. }) {
+            self.live_view = None;
+            return;
+        }
+        if self.run_state != "running" || at.elapsed() < Duration::from_millis(1000) {
+            return;
+        }
+        let Some(fresh) = self.live_lines(cmd) else { return };
+        if let Overlay::Text { lines, scroll, .. } = &mut self.overlay {
+            if follow {
+                *scroll = fresh.len();
+            }
+            *lines = fresh;
+        }
+        self.live_view = Some((cmd, Instant::now(), follow));
+        self.dirty = true;
+    }
+
+    /// Move the keyboard to the side panel, or say why there is nothing to move to.
+    fn to_panel(&mut self) {
+        if self.panel_visible {
+            self.focus_panel();
+        } else if self.panel_hidden {
+            self.flash("the side panel is hidden; /panel shows it");
+        } else {
+            self.flash("nothing in the side panel yet: it fills in with goals, work items and subagents");
+        }
+    }
+
+    /// The suggestion to show after the cursor, when it sits at the end of a command being typed.
+    fn ghost(&self) -> Option<String> {
+        if self.input.cursor != self.input.text.len() || self.completing.is_some() {
+            return None;
+        }
+        complete::ghost(&self.input.text)
+    }
+
+    /// Complete the command being typed. The first tab takes the best match;
+    /// more tabs walk through the others (shift+tab walks back). Returns false
+    /// when there is no command being typed, so tab can mean something else.
+    fn complete_command(&mut self, backward: bool) -> bool {
+        let typed = match &self.completing {
+            Some((typed, _)) => typed.clone(),
+            None if complete::typing_command(&self.input.text) && self.input.cursor == self.input.text.len() => self.input.text.clone(),
+            None => return false,
+        };
+        let found = complete::matches(&typed);
+        if found.is_empty() {
+            self.flash(format!("no command starts with {typed}; /help lists them"));
+            return true;
+        }
+        let at = match &self.completing {
+            None => 0,
+            Some((_, at)) if backward => (*at + found.len() - 1) % found.len(),
+            Some((_, at)) => (*at + 1) % found.len(),
+        };
+        self.input.set(complete::completed(found[at], found.len() == 1));
+        // With one match there is nothing to walk through: the next tab is free again.
+        self.completing = (found.len() > 1).then_some((typed, at));
+        self.dirty = true;
+        true
+    }
+
+    /// The lines of the /trace or /stats view, read from what the daemon has recorded so far.
+    fn live_lines(&self, cmd: &str) -> Option<Vec<String>> {
+        let root = self.session.as_ref().map(|s| s.root_id.clone())?;
+        let spans = self.store.spans_for_root(&root).unwrap_or_default();
+        let now = crate::telemetry::now_ms();
+        let mut lines = Vec::new();
+        if spans.is_empty() {
+            lines.push("Nothing is recorded for this session yet. Steps are recorded from the first message on.".into());
+        } else if cmd == "/trace" {
+            let notes = crate::telemetry::Notes::load(&self.store, &spans);
+            lines.extend(crate::telemetry::tree(&spans, &notes, now, self.overlay_text_width()));
+            lines.push(String::new());
+            lines.extend(crate::telemetry::summary(&spans, now));
+        } else {
+            lines.extend(crate::telemetry::stats(&spans, now));
+            lines.push(String::new());
+            lines.push(format!(
+                "interface: last frame drawn in {} ms, slowest {} ms, {} transcript entries",
+                self.frame_ms.0, self.frame_ms.1, self.entries.len()
+            ));
+        }
+        Some(lines)
+    }
+
+    /// Characters of text that fit across the text overlay.
+    fn overlay_text_width(&self) -> usize {
+        (self.last_width.saturating_sub(6).clamp(20, 100) as usize).saturating_sub(4)
     }
 
     // ---- choosing a model -------------------------------------------------
@@ -989,7 +1507,7 @@ impl App {
             "/new" => {
                 self.session = None;
                 self.goal = None;
-                self.objectives.clear();
+                self.work_anchors.clear();
                 self.milestones.clear();
                 self.agents.clear();
                 self.back_to = None;
@@ -1075,6 +1593,7 @@ impl App {
                     if let Ok(cfg) = Config::load(&self.paths) {
                         self.cfg = cfg;
                     }
+                    self.check_vault();
                     self.flash("configuration reloaded");
                 }
                 Err(e) => self.error(format!("{e:#}")),
@@ -1090,15 +1609,24 @@ impl App {
                     Some(s) => context::scopes_for(s),
                     None => vec!["global".to_string(), context::project_scope(&self.cwd)],
                 };
+                let state = crate::memory::refresh(&self.store, &self.cfg, &self.paths);
                 let found = if arg.is_empty() { self.store.memory_list(&scopes, 200) } else { self.store.memory_search(arg, &scopes, 30) };
                 let mut lines = Vec::new();
+                let root = crate::memory::root(&self.cfg, &self.paths);
+                lines.push(format!("Notes in {} (edit them with any editor)", root.dir.display()));
+                if !state.available {
+                    lines.push(format!("Not reachable right now: showing the index's copy. {}", state.why));
+                }
+                lines.extend(state.problems.iter().map(|p| format!("! {p}")));
+                lines.push(String::new());
+                let preamble = lines.len();
                 for m in found.unwrap_or_default() {
                     let scope = m.scope.split(':').next().unwrap_or("").to_string();
                     lines.push(format!("#{}  [{} · {}]  {}", m.id, scope, m.kind, m.title));
                     lines.extend(m.body.trim().lines().map(|l| format!("    {l}")));
                     lines.push(String::new());
                 }
-                if lines.is_empty() {
+                if lines.len() == preamble {
                     lines.push("Nothing here yet. /remember <text> saves a global memory; the agent saves its own as it learns.".into());
                 }
                 self.overlay = Overlay::Text { title: "memory".into(), lines, scroll: 0 };
@@ -1108,13 +1636,18 @@ impl App {
                     self.flash("usage: /remember <something that should always be known>");
                     return;
                 }
-                match self.store.memory_save("global", "user", &first_line(arg, 60), arg, self.sid().as_deref()) {
-                    Ok(id) => self.note(format!("remembered as #{id}; new sessions will see it")),
+                let sid = self.sid();
+                let title = first_line(arg, 60);
+                let entry = crate::memory::Entry { scope: "global", kind: "user", title: &title, body: arg, source: sid.as_deref() };
+                let saved = crate::memory::save(&self.store, &self.cfg, &self.paths, &entry);
+                match saved {
+                    Ok(s) if s.held => self.note(format!("remembered as #{} (held: the memory folder is not reachable right now)", s.id)),
+                    Ok(s) => self.note(format!("remembered as #{}; new sessions will see it", s.id)),
                     Err(e) => self.error(format!("{e:#}")),
                 }
             }
             "/forget" => match arg.trim_start_matches('#').parse::<i64>() {
-                Ok(id) => match self.store.memory_delete(id) {
+                Ok(id) => match crate::memory::delete(&self.store, &self.cfg, &self.paths, id) {
                     Ok(true) => self.note(format!("forgot #{id}")),
                     _ => self.flash(format!("there is no memory #{id}")),
                 },
@@ -1128,11 +1661,53 @@ impl App {
                     self.overlay = Overlay::Agents { sel: first_active };
                 }
             }
+            "/keys" => self.want_keys = true,
             "/back" => self.back().await,
+            "/cd" => {
+                if arg.is_empty() {
+                    let dir = self.session.as_ref().map(|s| s.cwd.clone()).unwrap_or_else(|| self.cwd.clone());
+                    self.flash(format!("working in {dir}; /cd <directory> moves this session"));
+                    return;
+                }
+                let Some(sid) = self.sid() else {
+                    // No session yet: the next one starts there.
+                    let target = crate::tools::resolve(&self.cwd, arg);
+                    if target.is_dir() {
+                        self.cwd = std::fs::canonicalize(&target).unwrap_or(target).to_string_lossy().into_owned();
+                        let here = crate::work::load(&self.store, Some(&self.project())).unwrap_or_default();
+                        self.set_work(here);
+                        self.flash(format!("the next session will work in {}", self.cwd));
+                    } else {
+                        self.flash(format!("{} is not a directory", target.display()));
+                    }
+                    return;
+                };
+                match self.conn.call(Command::SetDir { session: sid.clone(), dir: arg.to_string() }).await {
+                    // Reopen it: the header, the project's work and its anchors all follow the directory.
+                    Ok(_) => {
+                        if let Err(e) = self.attach(&sid).await {
+                            self.error(format!("{e:#}"));
+                        }
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
             "/voice" => self.toggle_voice(),
             "/panel" => {
                 self.panel_hidden = !self.panel_hidden;
                 self.panel_focus = false;
+            }
+            "/trace" | "/stats" => {
+                let cmd = if cmd == "/trace" { "/trace" } else { "/stats" };
+                let Some(lines) = self.live_lines(cmd) else {
+                    self.flash("no session open yet");
+                    return;
+                };
+                let title = if cmd == "/trace" { "what this session did" } else { "time and tokens in this session" };
+                // While it is working, open on the latest steps and keep up with them.
+                let working = self.run_state == "running";
+                self.live_view = Some((cmd, Instant::now(), working));
+                self.overlay = Overlay::Text { title: title.into(), scroll: if working { lines.len() } else { 0 }, lines };
             }
             other => self.flash(format!("unknown command {other}; /help lists them")),
         }
@@ -1208,7 +1783,45 @@ impl App {
             self.panel_focus = false;
         }
 
+        let action = self.keys.action(&key);
+        if action != Some(Action::Panel) && key.code != KeyCode::BackTab {
+            // Any other key ends a run through the matching commands.
+            self.completing = None;
+        }
         let page = self.view_h.saturating_sub(2).max(1) as i64;
+        // What [keys] binds comes first; everything after is typing and editing.
+        match action {
+            Some(Action::Interrupt) => {
+                if self.session.as_ref().is_some_and(|s| s.parent_id.is_some()) {
+                    // Looking at a subagent: this goes back to whoever spawned it.
+                    self.back().await;
+                } else if self.run_state == "running" {
+                    self.interrupt().await;
+                }
+                return;
+            }
+            Some(Action::Panel) => {
+                if !self.complete_command(false) {
+                    self.to_panel();
+                }
+                return;
+            }
+            Some(Action::ExpandTools) => return self.expanded = !self.expanded,
+            Some(Action::Thinking) => return self.show_thinking = !self.show_thinking,
+            Some(Action::Voice) => return self.toggle_voice(),
+            Some(Action::ScrollUp) => return self.scroll_by(page),
+            Some(Action::ScrollDown) => return self.scroll_by(-page),
+            Some(Action::Quit) => {
+                // With text in the box this is the usual "delete forward"; empty, it leaves.
+                if self.input.is_empty() {
+                    self.quit = true;
+                } else {
+                    self.input.delete();
+                }
+                return;
+            }
+            _ => {}
+        }
         match key.code {
             KeyCode::Enter if alt || shift || ctrl => self.input.insert("\n"),
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
@@ -1226,49 +1839,30 @@ impl App {
                     self.flash("press ctrl+c again to quit; the daemon and any running work continue");
                 }
             }
-            KeyCode::Char('d') if ctrl => {
-                if self.input.is_empty() {
-                    self.quit = true;
-                } else {
-                    self.input.delete();
-                }
-            }
-            KeyCode::Char('o') if ctrl => self.expanded = !self.expanded,
-            KeyCode::Char('t') if ctrl => self.show_thinking = !self.show_thinking,
             KeyCode::Char('a') if ctrl => self.input.home(),
             KeyCode::Char('e') if ctrl => self.input.end(),
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
             KeyCode::Char('w') if ctrl => self.input.delete_word(),
-            KeyCode::Esc => {
-                if self.session.as_ref().is_some_and(|s| s.parent_id.is_some()) {
-                    // Looking at a subagent: esc goes back to whoever spawned it.
-                    self.back().await;
-                } else if self.run_state == "running" {
-                    self.interrupt().await;
-                }
-            }
-            KeyCode::F(2) => self.toggle_voice(),
-            KeyCode::PageUp => self.scroll_by(page),
-            KeyCode::PageDown => self.scroll_by(-page),
             KeyCode::Up => self.input.up(),
             KeyCode::Down => self.input.down(),
             KeyCode::Left if ctrl || alt => self.input.word_left(),
             KeyCode::Right if ctrl || alt => self.input.word_right(),
             KeyCode::Left => self.input.left(),
+            // At the end of the line, right takes the suggestion, as in a shell.
+            KeyCode::Right if self.ghost().is_some() => {
+                self.complete_command(false);
+            }
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
             KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
-            KeyCode::Tab | KeyCode::BackTab => {
-                if self.panel_visible {
-                    self.focus_panel();
-                } else if self.panel_hidden {
-                    self.flash("the objectives panel is hidden; /panel shows it");
-                } else {
-                    self.flash("nothing in the side panel yet: it fills in with goals, objectives and subagents");
+            // Shift+tab walks back through the matching commands, or goes to the panel like tab.
+            KeyCode::BackTab => {
+                if !self.complete_command(true) {
+                    self.to_panel();
                 }
             }
             KeyCode::Char(c) if !ctrl && !alt => {
@@ -1360,6 +1954,12 @@ impl App {
                 _ => {}
             },
             Overlay::Text { scroll, lines, .. } => match code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp if self.live_view.is_some_and(|v| v.2) => {
+                    // Stop following the end, and move from where the view actually is.
+                    self.live_view = self.live_view.map(|(cmd, at, _)| (cmd, at, false));
+                    let step = if code == KeyCode::PageUp { page } else { 1 };
+                    *scroll = lines.len().saturating_sub(page + 2).saturating_sub(step);
+                }
                 KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(lines.len().saturating_sub(1)),
                 KeyCode::PageUp => *scroll = scroll.saturating_sub(page),
@@ -1396,7 +1996,7 @@ impl App {
         }
     }
 
-    // ---- objectives panel -------------------------------------------------
+    // ---- side panel ---------------------------------------------------------
 
     fn agent_row(&self, a: &AgentInfo, indent: usize) -> Nav {
         let (mark, mark_style) = agent_mark(&a.state, self.spin);
@@ -1422,9 +2022,95 @@ impl App {
         }
     }
 
-    /// The rows of the side panel: the goal, each objective with the subagents
-    /// working on it beneath, subagents that serve no listed objective, and
-    /// recorded milestones.
+    /// Take the project's work items in, with where this session touched each
+    /// and which session last touched each.
+    fn set_work(&mut self, items: Vec<WorkItem>) {
+        self.work = Overview { items };
+        self.work_anchors = match self.sid() {
+            Some(sid) => crate::work::anchors(&self.store, &sid).unwrap_or_default(),
+            None => Default::default(),
+        };
+        self.work_owners = crate::work::last_sessions(&self.store, &self.project()).unwrap_or_default();
+    }
+
+    /// The project the screen is about: the open session's, or this directory's.
+    fn project(&self) -> String {
+        context::project_dir(self.session.as_ref().map(|s| s.cwd.as_str()).unwrap_or(&self.cwd))
+    }
+
+    /// One work item as a panel row, then its subagents and its parts.
+    fn work_rows(&self, item: &WorkItem, depth: usize, agents: &[&AgentInfo], rows: &mut Vec<Nav>) {
+        let dim = Style::new().fg(Color::DarkGray);
+        let parts = self.work.children(&item.id);
+        let blockers = self.work.open_blockers(item);
+        let mine: Vec<&AgentInfo> = agents.iter().copied().filter(|a| a.objective == item.title).collect();
+        // Someone is on it right now: a running subagent, or this session itself.
+        let active = mine.iter().any(|a| a.state == "running")
+            || (item.status == "in_progress" && self.run_state == "running" && self.sid().as_deref() == Some(item.claimed_by.as_str()));
+        let (mark, style): (&'static str, Style) = match item.status.as_str() {
+            "done" => ("✓", Style::new().fg(Color::Green)),
+            "dropped" => ("✗", dim.add_modifier(Modifier::CROSSED_OUT)),
+            "waiting" => ("?", Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            "in_progress" => ("▶", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            _ if !parts.is_empty() => ("▾", Style::new().add_modifier(Modifier::BOLD)),
+            _ if !blockers.is_empty() => ("·", dim),
+            _ => ("○", Style::new()),
+        };
+        let mut text = item.title.clone();
+        if !parts.is_empty() {
+            let live: Vec<&WorkItem> = self.work.descendants(&item.id).into_iter().filter(|p| p.status != "dropped" && self.work.children(&p.id).is_empty()).collect();
+            text.push_str(&format!(" · {}/{}", live.iter().filter(|p| p.status == "done").count(), live.len()));
+        }
+        let mut detail: Vec<String> = Vec::new();
+        if !blockers.is_empty() && !item.closed() {
+            detail.push(format!("after: {}", blockers.iter().map(|b| b.title.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        if item.status == "in_progress" && !item.claimed_by.is_empty() {
+            detail.push(if item.claimed_agent.is_empty() { format!("held by session {}", item.claimed_by) } else { format!("held by subagent {}", item.claimed_agent) });
+        }
+        if !item.body.trim().is_empty() {
+            detail.push(first_line(&item.body, 300));
+        }
+        if !item.result.trim().is_empty() {
+            detail.push(format!("result: {}", first_line(&item.result, 300)));
+        }
+        // Not touched in this conversation, so there is nowhere here to jump to: say where its history is.
+        let here = self.work_anchors.get(&item.id).copied();
+        if here.is_none() {
+            if let Some(owner) = self.work_owners.get(&item.id).filter(|o| Some(o.as_str()) != self.sid().as_deref()) {
+                detail.push(format!("from another session: narsil resume {owner}"));
+            }
+        }
+        let mut nav = Nav {
+            text,
+            detail: detail.join("\n"),
+            mark,
+            mark_style: style,
+            style,
+            // i64::MAX is past every message: selecting such a row moves nothing.
+            anchor: Some(here.unwrap_or(i64::MAX)),
+            indent: depth * 2,
+            rank: match (item.status.as_str(), active) {
+                ("in_progress", true) => 3,
+                ("in_progress", false) => 2,
+                _ => 0,
+            },
+            open: None,
+        };
+        if active {
+            nav.mark = SPINNER[self.spin % SPINNER.len()];
+            nav.mark_style = Style::new().fg(Color::Yellow);
+        }
+        rows.push(nav);
+        rows.extend(mine.into_iter().map(|a| self.agent_row(a, depth * 2 + 2)));
+        for part in parts {
+            self.work_rows(part, depth + 1, agents, rows);
+        }
+    }
+
+    /// The rows of the side panel: the goal, the work graph with the subagents
+    /// holding each item beneath it, subagents that hold no item, and recorded
+    /// milestones.
     fn nav(&self) -> Vec<Nav> {
         let heading_style = Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD);
         let dim = Style::new().fg(Color::DarkGray);
@@ -1456,30 +2142,30 @@ impl App {
             rows.push(heading(format!("GOAL · {} · turn {}", g.status, g.iterations)));
             rows.push(row(g.objective.trim().to_string(), "◆", Style::new(), 0));
         }
-        if !self.objectives.is_empty() {
-            let done = self.objectives.iter().filter(|o| o.status == "done").count();
-            rows.push(heading(format!("OBJECTIVES · {done}/{}", self.objectives.len())));
-            for o in &self.objectives {
-                let (mark, style) = match o.status.as_str() {
-                    "done" => ("✓", Style::new().fg(Color::Green)),
-                    "active" => ("▶", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    "dropped" => ("✗", dim.add_modifier(Modifier::CROSSED_OUT)),
-                    _ => ("○", Style::new()),
-                };
-                let mine: Vec<&AgentInfo> = agents.iter().copied().filter(|a| a.objective == o.text).collect();
-                let mut nav = row(o.text.clone(), mark, style, o.anchor);
-                if mine.iter().any(|a| a.state == "running") {
-                    // Someone is on it right now, whatever status the list last gave it.
-                    nav.mark = SPINNER[self.spin % SPINNER.len()];
-                    nav.mark_style = Style::new().fg(Color::Yellow);
-                }
-                nav.rank = if o.status == "active" { 2 } else { 0 };
-                rows.push(nav);
-                rows.extend(mine.into_iter().map(|a| self.agent_row(a, 2)));
+        // The work graph, top-level items with their parts beneath: what is unfinished in
+        // this directory, and what this session itself worked on. Work finished in earlier
+        // sessions belongs to their history, which `narsil resume` opens; it is not shown
+        // here, where there would be nothing in the conversation to go to.
+        let mine = |i: &WorkItem| self.work_anchors.contains_key(&i.id) || self.work.descendants(&i.id).iter().any(|d| self.work_anchors.contains_key(&d.id));
+        let shown: Vec<&WorkItem> = self.work.items.iter().filter(|i| i.parent.is_none() && (!i.closed() || mine(i))).collect();
+        if !shown.is_empty() {
+            let leaves: Vec<&WorkItem> = shown
+                .iter()
+                .flat_map(|t| {
+                    let mut all = self.work.descendants(&t.id);
+                    all.push(t);
+                    all
+                })
+                .filter(|i| self.work.children(&i.id).is_empty() && i.status != "dropped")
+                .collect();
+            let done = leaves.iter().filter(|i| i.status == "done").count();
+            rows.push(heading(format!("WORK · {done}/{} done", leaves.len())));
+            for top in shown {
+                self.work_rows(top, 0, &agents, &mut rows);
             }
         }
         let loose: Vec<&AgentInfo> =
-            agents.iter().copied().filter(|a| !self.objectives.iter().any(|o| o.text == a.objective)).collect();
+            agents.iter().copied().filter(|a| !self.work.items.iter().any(|i| i.title == a.objective)).collect();
         if !loose.is_empty() {
             // Everything still in flight, and the most recent few that are not.
             const RECENT: usize = 6;
@@ -1505,7 +2191,7 @@ impl App {
         }
         if !self.milestones.is_empty() {
             rows.push(heading("MILESTONES".into()));
-            for (text, anchor) in &self.milestones {
+            for (text, anchor, _) in &self.milestones {
                 rows.push(row(text.clone(), "•", dim, *anchor));
             }
         }
@@ -1575,7 +2261,7 @@ impl App {
             (true, true) => " ↑↓ jump · enter open · esc live ",
             (true, false) => " ↑↓ jump · esc live ",
         };
-        let title = if self.objectives.is_empty() && self.goal.is_none() { " agents " } else { " objectives " };
+        let title = if self.work.items.is_empty() && self.goal.is_none() { " agents " } else { " work " };
         let block = UiBlock::bordered()
             .border_style(Style::new().fg(if focus { Color::LightBlue } else { Color::DarkGray }))
             .title(title)
@@ -1637,8 +2323,7 @@ impl App {
 
     // ---- drawing ----------------------------------------------------------
 
-    fn draw(&mut self, f: &mut Frame) {
-        let area = f.area();
+    fn draw(&mut self, f: &mut Frame, area: Rect) {
         let (input_lines, cursor) = self.input.layout(area.width.saturating_sub(4) as usize);
         let input_h = input_lines.len().clamp(1, 8) as u16 + 2;
         let approval_h = match self.approvals.front() {
@@ -1848,11 +2533,26 @@ impl App {
         } else {
             (" enter send · alt+enter new line · /help ".to_string(), Color::DarkGray)
         };
+        // While a command is being typed, the title lists what fits instead.
+        let typed = self.completing.as_ref().map(|(typed, _)| typed.as_str()).unwrap_or(&self.input.text);
+        let (title, color) = match complete::hint(typed, area.width.saturating_sub(6) as usize) {
+            Some(hint) if self.approvals.is_empty() => (format!(" {hint} "), Color::LightBlue),
+            _ => (title, color),
+        };
         let block = UiBlock::bordered().border_style(Style::new().fg(color)).title(title);
         let inner = block.inner(area);
         let room = inner.height as usize;
         let first = cursor.0.saturating_sub(room.saturating_sub(1));
-        let shown: Vec<Line> = lines.iter().skip(first).take(room).map(|l| Line::raw(format!(" {l}"))).collect();
+        let ghost = self.ghost().filter(|_| lines.len() == 1);
+        let shown: Vec<Line> = lines
+            .iter()
+            .skip(first)
+            .take(room)
+            .map(|l| match &ghost {
+                Some(rest) => Line::from(vec![Span::raw(format!(" {l}")), Span::styled(rest.clone(), Style::new().fg(Color::DarkGray))]),
+                None => Line::raw(format!(" {l}")),
+            })
+            .collect();
         f.render_widget(Paragraph::new(shown).block(block), area);
         if matches!(self.overlay, Overlay::None) && self.approvals.is_empty() {
             let x = inner.x + 1 + cursor.1 as u16;
@@ -1890,13 +2590,22 @@ impl App {
             Some(s) => format!("ctx {} · {} · {} ", fmt_tokens(s.context_tokens), s.perm_mode, s.model),
             None => format!("{} · {} ", self.pending_mode.as_deref().unwrap_or(&self.cfg.permissions.mode), self.model_in_use()),
         };
+        // The Obsidian vault, when one is set: there, away, and how much of it is closed.
+        let closed = self.cfg.obsidian.exclude.iter().filter(|e| !e.trim().is_empty()).count();
+        let (vault, vault_style) = match self.vault {
+            Some((true, _)) if closed > 0 => (format!("{} vault, {closed} closed · ", render::VAULT_MARK), Style::new().fg(render::VAULT)),
+            Some((true, _)) => (format!("{} vault · ", render::VAULT_MARK), Style::new().fg(render::VAULT)),
+            Some((false, _)) => (format!("{} vault away · ", render::VAULT_MARK), Style::new().fg(Color::Yellow)),
+            None => (String::new(), Style::new()),
+        };
         let width = area.width as usize;
-        let room = width.saturating_sub(right.chars().count() + 1);
+        let room = width.saturating_sub(right.chars().count() + vault.chars().count() + 1);
         let left = if left.chars().count() > room { format!("{}…", left.chars().take(room.saturating_sub(1)).collect::<String>()) } else { left };
-        let gap = width.saturating_sub(left.chars().count() + right.chars().count());
+        let gap = width.saturating_sub(left.chars().count() + vault.chars().count() + right.chars().count());
         let line = Line::from(vec![
             Span::styled(left, style),
             Span::raw(" ".repeat(gap)),
+            Span::styled(vault, vault_style),
             Span::styled(right, Style::new().fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(line), area);

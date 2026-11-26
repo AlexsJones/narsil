@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::{ToolCtx, ToolOutput, opt_bool, opt_str, opt_u64, resolve, str_arg};
+use super::{ToolCtx, ToolOutput, guard, opt_bool, opt_str, opt_u64, resolve, str_arg, vault_near};
+use crate::obsidian::Vault;
 use crate::util::floor_boundary;
 
 const MAX_READ_BYTES: u64 = 50 * 1024 * 1024;
@@ -17,6 +18,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 pub async fn read_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let path = resolve(&ctx.session.cwd, str_arg(input, "path")?);
+    guard(ctx.cfg, &path)?;
     let meta = std::fs::metadata(&path).with_context(|| format!("{}", path.display()))?;
     if meta.is_dir() {
         return Ok(ToolOutput::err(format!("{} is a directory; use list_dir", path.display())));
@@ -68,6 +70,7 @@ pub async fn read_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
 pub async fn write_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let path = resolve(&ctx.session.cwd, str_arg(input, "path")?);
+    guard(ctx.cfg, &path)?;
     let content = str_arg(input, "content")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -86,6 +89,7 @@ pub async fn write_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
 pub async fn edit_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let path = resolve(&ctx.session.cwd, str_arg(input, "path")?);
+    guard(ctx.cfg, &path)?;
     let old = str_arg(input, "old_string")?;
     let new = str_arg(input, "new_string")?;
     if old.is_empty() {
@@ -124,9 +128,15 @@ pub async fn edit_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
 
 pub async fn list_dir(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let path = resolve(&ctx.session.cwd, opt_str(&ctx.call.input, "path").unwrap_or("."));
+    guard(ctx.cfg, &path)?;
+    let vault = vault_near(ctx.cfg, &path);
     let mut entries: Vec<(String, bool, u64)> = Vec::new();
     for e in std::fs::read_dir(&path).with_context(|| format!("{}", path.display()))? {
         let e = e?;
+        // What is closed in the vault is not listed either.
+        if vault.as_ref().is_some_and(|v| v.closes(&e.path())) {
+            continue;
+        }
         let meta = e.metadata().ok();
         let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
         entries.push((e.file_name().to_string_lossy().into_owned(), is_dir, meta.map(|m| m.len()).unwrap_or(0)));
@@ -147,17 +157,29 @@ pub async fn list_dir(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     Ok(ToolOutput::ok(out))
 }
 
-fn walker(base: &Path) -> ignore::Walk {
+/// Walk a directory, leaving out `.git` and, when the walk reaches into the
+/// Obsidian vault, the parts of it that are closed.
+fn walker(base: &Path, vault: Option<Vault>) -> ignore::Walk {
     ignore::WalkBuilder::new(base)
         .hidden(false)
-        .filter_entry(|e| e.file_name() != ".git")
+        .filter_entry(move |e| e.file_name() != ".git" && !vault.as_ref().is_some_and(|v| v.closes_as_written(e.path())))
         .build()
+}
+
+/// Where a walk starts, and the vault if the walk can reach it. Inside the
+/// vault the start is given with links resolved, so that every entry under it
+/// can be checked by its path.
+fn walk_from(ctx: &ToolCtx<'_>, base: PathBuf) -> Result<(PathBuf, Option<Vault>)> {
+    guard(ctx.cfg, &base)?;
+    let vault = vault_near(ctx.cfg, &base);
+    let base = vault.as_ref().map(|v| v.settle(&base)).unwrap_or(base);
+    Ok((base, vault))
 }
 
 pub async fn glob(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let pattern = str_arg(input, "pattern")?.to_string();
-    let base = resolve(&ctx.session.cwd, opt_str(input, "path").unwrap_or("."));
+    let (base, vault) = walk_from(ctx, resolve(&ctx.session.cwd, opt_str(input, "path").unwrap_or(".")))?;
     let found = tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, usize)> {
         let matcher = globset::GlobBuilder::new(pattern.trim_start_matches("./"))
             .literal_separator(true)
@@ -165,7 +187,7 @@ pub async fn glob(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
             .map_err(|e| anyhow!("bad glob pattern: {e}"))?
             .compile_matcher();
         let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        for entry in walker(&base).flatten() {
+        for entry in walker(&base, vault).flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -198,7 +220,7 @@ pub async fn grep(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         .case_insensitive(opt_bool(input, "ignore_case"))
         .build()
         .map_err(|e| anyhow!("bad regular expression: {e}"))?;
-    let base = resolve(&ctx.session.cwd, opt_str(input, "path").unwrap_or("."));
+    let (base, vault) = walk_from(ctx, resolve(&ctx.session.cwd, opt_str(input, "path").unwrap_or(".")))?;
     let filter = match opt_str(input, "glob") {
         Some(g) => Some(
             globset::GlobBuilder::new(g).build().map_err(|e| anyhow!("bad glob filter: {e}"))?.compile_matcher(),
@@ -216,7 +238,7 @@ pub async fn grep(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
             Box::new(std::iter::once(base.clone()))
         } else {
             Box::new(
-                walker(&base)
+                walker(&base, vault)
                     .flatten()
                     .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
                     .map(|e| e.into_path()),

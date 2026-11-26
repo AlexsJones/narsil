@@ -8,9 +8,13 @@
 //! their own transcripts.
 //!
 //! Each child also has a `subagents` record saying what it was spawned for
-//! (its task, and the parent's objective it serves) and how it ended. Every
-//! change to that record is pushed to clients, which is what lets a UI show
-//! who is working on what while it happens.
+//! (its task, and the work item it took) and how it ended. Every change to
+//! that record is pushed to clients, which is what lets a UI show who is
+//! working on what while it happens.
+//!
+//! A child given a work item takes it before it starts, so no two agents hold
+//! the same one, and is handed what the item rests on. If it ends without
+//! closing the item, the item is released for someone else.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,49 +23,48 @@ use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::{ToolCtx, ToolOutput};
 use crate::engine::{Engine, Outcome};
-use crate::store::{NewSession, Objective, Store};
+use crate::store::{NewSession, Store};
+use crate::work::{By, Graph, Overview};
 use crate::types::{Block, Role, blocks_text};
 use crate::util::{first_line, floor_boundary};
 
 struct Planned {
     name: String,
     task: String,
-    objective: String,
+    /// The title of the work item it takes, or whatever was written if that is not an item.
+    work: String,
 }
 
-/// Match what the model wrote against the parent's objectives: a 1-based
-/// number, the exact text, or a fragment that fits exactly one entry. Text
-/// that matches nothing is kept as given, so the link is still shown.
-pub fn resolve_objective(given: Option<&Value>, objectives: &[Objective]) -> String {
+/// Match what the model wrote against the project's work items: an exact
+/// title or id, or a fragment that fits exactly one item that is not finished.
+/// Text that matches nothing is kept as given, so it is still shown.
+pub fn resolve_work(given: Option<&Value>, view: &Overview) -> String {
     let text = match given {
-        Some(Value::Number(n)) => n.to_string(),
         Some(Value::String(s)) => s.trim().to_string(),
         _ => return String::new(),
     };
     if text.is_empty() {
         return text;
     }
-    if let Ok(n) = text.trim_start_matches('#').parse::<usize>() {
-        if let Some(o) = n.checked_sub(1).and_then(|i| objectives.get(i)) {
-            return o.text.clone();
-        }
+    if let Some(item) = view.find(&text) {
+        return item.title.clone();
     }
     let wanted = text.to_lowercase();
-    if let Some(o) = objectives.iter().find(|o| o.text.to_lowercase() == wanted) {
-        return o.text.clone();
-    }
-    let partial: Vec<&Objective> = objectives
+    let partial: Vec<&crate::work::Item> = view
+        .items
         .iter()
-        .filter(|o| {
-            let have = o.text.to_lowercase();
+        .filter(|i| !i.closed())
+        .filter(|i| {
+            let have = i.title.to_lowercase();
             have.contains(&wanted) || wanted.contains(&have)
         })
         .collect();
     match partial[..] {
-        [only] => only.text.clone(),
+        [only] => only.title.clone(),
         _ => first_line(&text, 200),
     }
 }
@@ -146,7 +149,9 @@ pub async fn spawn_agents(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         bail!("`agents` must contain between 1 and 16 entries");
     }
     let store = &ctx.engine.store;
-    let objectives = store.objectives_get(&ctx.session.id)?;
+    let project = crate::context::project_dir(&ctx.session.cwd);
+    crate::work::refresh(store, cfg, &ctx.engine.paths);
+    let view = Overview::of(store, &project)?;
     let mut plan: Vec<Planned> = Vec::new();
     for (i, a) in list.iter().enumerate() {
         let task = a.get("task").and_then(Value::as_str).unwrap_or("").trim();
@@ -161,8 +166,8 @@ pub async fn spawn_agents(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
             name = format!("{base}-{n}");
             n += 1;
         }
-        let objective = resolve_objective(a.get("objective"), &objectives);
-        plan.push(Planned { name, task: task.to_string(), objective });
+        let work = resolve_work(a.get("work").or_else(|| a.get("objective")), &view);
+        plan.push(Planned { name, task: task.to_string(), work });
     }
 
     // Children from an earlier, interrupted attempt at this same call.
@@ -187,14 +192,31 @@ pub async fn spawn_agents(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
                 model: model.clone(),
                 perm_mode: ctx.session.perm_mode.clone(),
             })?;
-            store.pending_add(&child.id, &p.task)?;
+            // Take the item for the child before anything else can, and hand it what the item rests on.
+            let mut brief = p.task.clone();
+            if view.find(&p.work).is_some() {
+                let engine = ctx.engine;
+                let by = By { session: &child.id, agent: &p.name, message_id: ctx.call.message_id };
+                let taken = Graph::open(store, cfg, &engine.paths).claim(by, &project, &p.work, &|s: &str| engine.is_running(s));
+                brief = match taken {
+                    Ok(item) => format!(
+                        "[narsil] You hold the work item {:?}. Do it, check it, and close it with work_done (result and \
+                         evidence). File anything else you find as a follow-up.\n\n{}\nYour instructions:\n\n{}",
+                        item.title,
+                        Overview::of(store, &project)?.bundle(&item),
+                        p.task
+                    ),
+                    Err(e) => format!("[narsil] The work item {:?} could not be taken for you ({e:#}); do the task without it.\n\n{}", p.work, p.task),
+                };
+            }
+            store.pending_add(&child.id, &brief)?;
             children.insert(p.name.clone(), json!(child.id));
             // Journal after every child so a crash never orphans one.
             store.tool_call_set_state(&ctx.session.id, ctx.call, &json!({ "children": children }))?;
         }
         // Idempotent, so a child journaled just before a crash still gets its record.
         let child_id = children[&p.name].as_str().unwrap_or_default();
-        store.subagent_add(child_id, &ctx.call.id, &p.task, &p.objective)?;
+        store.subagent_add(child_id, &ctx.call.id, &p.task, &p.work)?;
         if let Some(child) = store.get_session(child_id)? {
             ctx.engine.emit_agent(&child, None);
         }
@@ -213,12 +235,17 @@ pub async fn spawn_agents(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         let engine = ctx.engine.clone();
         let cancel = ctx.cancel.child_token();
         let id = child_id.clone();
-        let handle = tokio::spawn(async move {
-            let _slot = slot;
-            run_child(&engine, &id, cancel).await
-        });
+        // Carries the spawning call's span into the task, so the child's run is recorded beneath it.
+        let handle = tokio::spawn(
+            async move {
+                let _slot = slot;
+                run_child(&engine, &id, cancel).await
+            }
+            .in_current_span(),
+        );
         running.push((p.name.clone(), child_id, handle));
     }
+    ctx.engine.emit_work(&project);
 
     let mut out = String::new();
     let mut failed = 0;
@@ -246,7 +273,16 @@ pub async fn spawn_agents(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
             }
         }
         out.push_str("\n\n");
+        // An item its agent did not close goes back, so it is not left looking busy.
+        let held = Overview::of(store, &project)?.items.into_iter().find(|i| i.status == "in_progress" && i.claimed_by == child_id);
+        if let Some(item) = held {
+            let by = By { session: &ctx.session.id, agent: "", message_id: ctx.call.message_id };
+            let note = format!("subagent {name} ended without closing it");
+            let _ = Graph::open(store, cfg, &ctx.engine.paths).update(by, &project, &item.title, Some("open"), Some(&note), &[]);
+            out.push_str(&format!("[The work item {:?} was not closed by {name} and is open again.]\n\n", item.title));
+        }
     }
+    ctx.engine.emit_work(&project);
     Ok(ToolOutput { content: out, is_error: failed == total })
 }
 
@@ -254,29 +290,36 @@ pub async fn spawn_agents(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
 mod tests {
     use super::*;
 
-    fn objectives() -> Vec<Objective> {
-        ["Tokenizer passes the spec tests", "README documents the CLI", "Benchmarks recorded"]
-            .iter()
-            .map(|t| Objective { text: t.to_string(), status: "pending".into(), anchor: 1 })
-            .collect()
+    fn view() -> Overview {
+        let item = |id: &str, title: &str, status: &str| crate::work::Item {
+            id: id.into(),
+            title: title.into(),
+            status: status.into(),
+            ..Default::default()
+        };
+        Overview {
+            items: vec![
+                item("w-aaaaa", "Tokenizer passes the spec tests", "open"),
+                item("w-bbbbb", "README documents the CLI", "open"),
+                item("w-ccccc", "README drafted", "done"),
+            ],
+        }
     }
 
     #[test]
-    fn objective_links_resolve_to_the_canonical_wording() {
-        let o = objectives();
-        let r = |v: Value| resolve_objective(Some(&v), &o);
-        assert_eq!(r(json!("README documents the CLI")), "README documents the CLI");
-        assert_eq!(r(json!("  readme documents the cli ")), "README documents the CLI");
-        assert_eq!(r(json!(1)), "Tokenizer passes the spec tests");
-        assert_eq!(r(json!("#3")), "Benchmarks recorded");
+    fn a_work_link_resolves_to_the_items_own_title() {
+        let v = view();
+        let r = |x: Value| resolve_work(Some(&x), &v);
+        assert_eq!(r(json!("readme documents the cli")), "README documents the CLI");
+        assert_eq!(r(json!("[[Tokenizer passes the spec tests]]")), "Tokenizer passes the spec tests");
+        assert_eq!(r(json!("w-bbbbb")), "README documents the CLI");
         assert_eq!(r(json!("tokenizer")), "Tokenizer passes the spec tests");
-        assert_eq!(r(json!("Objective: Benchmarks recorded.")), "Benchmarks recorded");
-        // Ambiguous or unknown text is kept, not guessed at.
+        assert_eq!(r(json!("README")), "README documents the CLI", "a finished item is not what a fragment means");
+        // Unknown or ambiguous text is kept, not guessed at.
         assert_eq!(r(json!("the")), "the");
         assert_eq!(r(json!("Deploy to production")), "Deploy to production");
-        assert_eq!(r(json!(9)), "9");
-        assert_eq!(resolve_objective(None, &o), "");
-        assert_eq!(r(json!("")), "");
+        assert_eq!(resolve_work(None, &v), "");
+        assert_eq!(r(json!(3)), "");
     }
 
     #[test]

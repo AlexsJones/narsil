@@ -9,8 +9,7 @@ use serde_json::Value;
 
 use super::{ToolCtx, ToolOutput, opt_str, opt_u64, str_arg};
 use crate::context::{project_scope, scopes_for, task_scope};
-use crate::proto::Event;
-use crate::store::Objective;
+use crate::memory;
 
 fn scope_label(scope: &str) -> &'static str {
     if scope == "global" {
@@ -20,6 +19,10 @@ fn scope_label(scope: &str) -> &'static str {
     } else {
         "task"
     }
+}
+
+fn link_list(links: &[String]) -> String {
+    links.iter().map(|l| format!("[[{l}]]")).collect::<Vec<_>>().join(", ")
 }
 
 pub fn memory_save(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
@@ -41,89 +44,112 @@ pub fn memory_save(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         "task" => "note",
         _ => "project",
     };
-    let kind = opt_str(input, "kind").unwrap_or(default_kind);
-    let id = ctx.engine.store.memory_save(&scope, kind, title, body, Some(&ctx.session.id))?;
-    Ok(ToolOutput::ok(format!("Saved to {which} memory as entry {id}: {title}")))
+    let kind = opt_str(input, "kind").filter(|k| memory::KINDS.contains(k)).unwrap_or(default_kind);
+    let engine = ctx.engine;
+    let entry = memory::Entry { scope: &scope, kind, title, body, source: Some(&ctx.session.id) };
+    let saved = memory::save(&engine.store, ctx.cfg, &engine.paths, &entry)?;
+    let mut out = format!("Saved to {which} memory: {title}");
+    if !saved.links.is_empty() {
+        out.push_str(&format!("\nLinks to: {}", link_list(&saved.links)));
+    }
+    if saved.held {
+        out.push_str(
+            "\nThe memory folder is not reachable right now, so this is held and will be written there when it \
+             returns. It is already used in new sessions.",
+        );
+    }
+    Ok(ToolOutput::ok(out))
 }
 
 pub fn memory_search(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let query = str_arg(input, "query")?;
     let limit = opt_u64(input, "limit").unwrap_or(8).clamp(1, 50) as i64;
-    let hits = ctx.engine.store.memory_search(query, &scopes_for(ctx.session), limit)?;
+    let engine = ctx.engine;
+    let scopes = scopes_for(ctx.session);
+    memory::refresh(&engine.store, ctx.cfg, &engine.paths);
+    let hits = engine.store.memory_search(query, &scopes, limit)?;
     if hits.is_empty() {
         return Ok(ToolOutput::ok("Nothing in memory matches."));
     }
     let mut out = String::new();
     for m in hits {
-        out.push_str(&format!(
-            "## {} [{} · {} · id {}]\n{}\n\n",
-            m.title,
-            scope_label(&m.scope),
-            m.kind,
-            m.id,
-            m.body.trim()
-        ));
+        out.push_str(&format!("## {} [{} · {}]\n{}\n", m.title, scope_label(&m.scope), m.kind, m.body.trim()));
+        let back = engine.store.memory_backlinks(&m.title, &scopes)?;
+        if !back.is_empty() {
+            out.push_str(&format!("Linked from: {}\n", link_list(&back)));
+        }
+        out.push('\n');
+    }
+    out.push_str("Follow a [[link]] with memory_read.");
+    Ok(ToolOutput::ok(out))
+}
+
+/// One entry with its neighbours in the graph: what it links to and what links to it.
+pub fn memory_read(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
+    let title = str_arg(&ctx.call.input, "title")?;
+    let engine = ctx.engine;
+    let scopes = scopes_for(ctx.session);
+    memory::refresh(&engine.store, ctx.cfg, &engine.paths);
+    let Some(found) = memory::read(&engine.store, &scopes, title)? else {
+        let near = engine.store.memory_search(title, &scopes, 5)?;
+        let hint = if near.is_empty() {
+            String::new()
+        } else {
+            format!(" Closest entries: {}.", link_list(&near.into_iter().map(|m| m.title).collect::<Vec<_>>()))
+        };
+        return Ok(ToolOutput::err(format!(
+            "There is no memory entry called {title:?}.{hint} A link to a name with no entry is a note not written yet."
+        )));
+    };
+    let m = &found.entry;
+    let mut out = format!("## {} [{} · {}]\n{}\n", m.title, scope_label(&m.scope), m.kind, m.body.trim());
+    if !found.links.is_empty() {
+        // A link may also point out of memory, at one of the user's own notes.
+        let vault = crate::obsidian::Vault::open(ctx.cfg);
+        let shown: Vec<String> = found
+            .links
+            .iter()
+            .map(|(l, exists)| match (exists, vault.as_ref().is_some_and(|v| v.resolve(l).is_ok())) {
+                (true, _) => format!("[[{l}]]"),
+                (false, true) => format!("[[{l}]] (a note in the vault: vault_read)"),
+                (false, false) => format!("[[{l}]] (no entry yet)"),
+            })
+            .collect();
+        out.push_str(&format!("\nLinks to: {}", shown.join(", ")));
+    }
+    if !found.backlinks.is_empty() {
+        out.push_str(&format!("\nLinked from: {}", link_list(&found.backlinks)));
     }
     Ok(ToolOutput::ok(out))
 }
 
 pub fn memory_forget(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
-    let id = ctx
-        .call
-        .input
-        .get("id")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-        .ok_or_else(|| anyhow!("missing required integer parameter `id`"))?;
-    if ctx.engine.store.memory_delete(id)? {
-        Ok(ToolOutput::ok(format!("Deleted memory entry {id}.")))
-    } else {
-        Ok(ToolOutput::err(format!("There is no memory entry {id}.")))
-    }
+    let input = &ctx.call.input;
+    let engine = ctx.engine;
+    let scopes = scopes_for(ctx.session);
+    memory::refresh(&engine.store, ctx.cfg, &engine.paths);
+    let by_id = input.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let entry = match (opt_str(input, "title"), by_id) {
+        (Some(title), _) => engine.store.memory_find(&scopes, title)?,
+        (None, Some(id)) => engine.store.memory_get(id)?.filter(|m| scopes.contains(&m.scope)),
+        (None, None) => return Err(anyhow!("missing required string parameter `title`")),
+    };
+    let Some(entry) = entry else {
+        return Ok(ToolOutput::err("There is no such memory entry in this session's scopes."));
+    };
+    memory::delete(&engine.store, ctx.cfg, &engine.paths, entry.id)?;
+    Ok(ToolOutput::ok(format!("Forgot the {} memory entry {:?}.", scope_label(&entry.scope), entry.title)))
 }
 
-/// Replace the session's objectives. An entry keeps its anchor (the message it
-/// was last changed in) unless it is new or its status changed in this call.
-pub fn objectives(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
-    let Some(list) = ctx.call.input.get("items").and_then(Value::as_array) else {
-        bail!("missing required array parameter `items`");
-    };
-    if list.len() > 40 {
-        bail!("at most 40 objectives; merge the smaller ones");
-    }
-    let store = &ctx.engine.store;
-    let previous = store.objectives_get(&ctx.session.id)?;
-    let mut items: Vec<Objective> = Vec::new();
-    for entry in list {
-        let text = entry.get("text").and_then(Value::as_str).unwrap_or("").trim();
-        if text.is_empty() {
-            bail!("every objective needs a `text`");
-        }
-        let status = match entry.get("status").and_then(Value::as_str).unwrap_or("pending") {
-            "pending" | "todo" => "pending",
-            "active" | "in_progress" | "doing" => "active",
-            "done" | "completed" | "complete" => "done",
-            "dropped" | "cancelled" | "skipped" => "dropped",
-            other => bail!("unknown status {other:?}; use pending, active, done or dropped"),
-        };
-        if items.iter().any(|i| i.text == text) {
-            continue;
-        }
-        let anchor = match previous.iter().find(|p| p.text == text) {
-            Some(p) if p.status == status => p.anchor,
-            _ => ctx.call.message_id,
-        };
-        items.push(Objective { text: text.to_string(), status: status.to_string(), anchor });
-    }
-    store.objectives_set(&ctx.session.id, &items)?;
-    ctx.engine.emit(ctx.session, Event::Objectives { items: items.clone() });
-    let count = |s: &str| items.iter().filter(|i| i.status == s).count();
+pub fn change_directory(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
+    let path = str_arg(&ctx.call.input, "path")?;
+    let create = super::opt_bool(&ctx.call.input, "create");
+    let now = ctx.engine.change_directory(&ctx.session.id, path, create, false)?;
+    ctx.engine.emit_work(&crate::context::project_dir(&now));
     Ok(ToolOutput::ok(format!(
-        "Objectives recorded: {} done, {} active, {} pending{}.",
-        count("done"),
-        count("active"),
-        count("pending"),
-        if count("dropped") > 0 { format!(", {} dropped", count("dropped")) } else { String::new() }
+        "The working directory is now {now}. Commands start here and relative paths resolve here; project memory and \
+         the work plan are this directory's. Call work_next to see whether work is already laid out for it."
     )))
 }
 
@@ -136,17 +162,82 @@ pub fn goal_tool(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         "goal_update" => {
             let note = str_arg(input, "note")?.trim();
             ctx.engine.store.goal_log(goal_id, "progress", note)?;
+            ctx.engine.write_goal_note(goal_id);
             Ok(ToolOutput::ok("Recorded in the goal's progress journal."))
         }
         "goal_complete" => {
             let summary = str_arg(input, "summary")?.trim();
+            let project = crate::context::project_dir(&ctx.session.cwd);
+            let goal_title = ctx.engine.store.goal_get(goal_id)?.map(|g| crate::util::first_line(&g.objective, 70)).unwrap_or_default();
+            let save_lessons = |from: &str| {
+                let saved = memory::save_learned(&ctx.engine.store, ctx.cfg, &ctx.engine.paths, &project, from, &ctx.session.id, input.get("lessons"));
+                if saved.is_empty() { String::new() } else { format!(" Saved to memory for next time: {}.", saved.join("; ")) }
+            };
+            crate::work::refresh(&ctx.engine.store, ctx.cfg, &ctx.engine.paths);
+            let view = crate::work::Overview::of(&ctx.engine.store, &project)?;
+            let Some(root) = view.items.iter().find(|i| i.goal == goal_id) else {
+                // Done without a plan. Leave a record all the same, so a later session
+                // can see that this was done here, what came of it and how it was checked.
+                let engine = ctx.engine;
+                let title = ctx.engine.store.goal_get(goal_id)?.map(|g| crate::util::first_line(&g.objective, 70)).unwrap_or_else(|| goal_id.to_string());
+                let by = crate::work::By { session: &ctx.session.id, agent: "", message_id: ctx.call.message_id };
+                {
+                    let graph = crate::work::Graph::open(&engine.store, ctx.cfg, &engine.paths);
+                    graph.plan(by, &project, goal_id, Some(&title), &[])?;
+                    let _ = graph.done(by, &project, &title, summary, "", &|s: &str| engine.is_running(s));
+                }
+                engine.emit_work(&project);
+                let lessons = save_lessons(&title);
+                engine.set_goal_status(goal_id, "completed", summary)?;
+                return Ok(ToolOutput::ok(format!(
+                    "The goal is marked complete, and recorded as a finished work item with your summary as its result.{lessons} \
+                     End your turn with a brief closing message; no further work is expected."
+                )));
+            };
+            {
+                let open: Vec<&str> = view.descendants(&root.id).into_iter().filter(|i| !i.closed()).map(|i| i.title.as_str()).collect();
+                if !open.is_empty() {
+                    return Ok(ToolOutput::err(format!(
+                        "The goal is not complete: {} item{} still open ({}). Finish them and close each with work_done, \
+                         or drop what will not be done with work_update, giving the reason. If they wait on the user, \
+                         call goal_blocked.",
+                        open.len(),
+                        if open.len() == 1 { " is" } else { "s are" },
+                        open.join("; ")
+                    )));
+                }
+            }
+            let from = view.items.iter().find(|i| i.goal == goal_id).map(|i| i.title.clone()).unwrap_or(goal_title);
+            let lessons = save_lessons(&from);
             ctx.engine.set_goal_status(goal_id, "completed", summary)?;
-            Ok(ToolOutput::ok("The goal is marked complete. End your turn with a brief closing message; no further work is expected."))
+            Ok(ToolOutput::ok(format!(
+                "The goal is marked complete.{lessons} End your turn with a brief closing message; no further work is expected."
+            )))
         }
         "goal_blocked" => {
             let reason = str_arg(input, "reason")?.trim();
             ctx.engine.set_goal_status(goal_id, "blocked", reason)?;
-            Ok(ToolOutput::ok("The goal is marked blocked and the user has been notified. End your turn now; work resumes when they reply."))
+            // What it found to be a dead end on the way here is kept, marked as one.
+            let dead_ends = input.get("dead_ends").and_then(Value::as_array).map(|list| {
+                Value::Array(
+                    list.iter()
+                        .cloned()
+                        .map(|mut e| {
+                            if let Some(entry) = e.as_object_mut() {
+                                entry.insert("dead_end".into(), Value::Bool(true));
+                            }
+                            e
+                        })
+                        .collect(),
+                )
+            });
+            let project = crate::context::project_dir(&ctx.session.cwd);
+            let from = ctx.engine.store.goal_get(goal_id)?.map(|g| crate::util::first_line(&g.objective, 70)).unwrap_or_default();
+            let saved = memory::save_learned(&ctx.engine.store, ctx.cfg, &ctx.engine.paths, &project, &from, &ctx.session.id, dead_ends.as_ref());
+            let kept = if saved.is_empty() { String::new() } else { format!(" Saved to memory for next time: {}.", saved.join("; ")) };
+            Ok(ToolOutput::ok(format!(
+                "The goal is marked blocked and the user has been notified.{kept} End your turn now; work resumes when they reply."
+            )))
         }
         other => Ok(ToolOutput::err(format!("unknown goal tool: {other}"))),
     }

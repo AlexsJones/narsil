@@ -6,6 +6,8 @@ pub mod agents;
 pub mod fs;
 pub mod misc;
 pub mod shell;
+pub mod vault;
+pub mod work;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,6 +72,20 @@ pub fn opt_bool(input: &Value, key: &str) -> bool {
 pub fn resolve(cwd: &str, path: &str) -> PathBuf {
     let p = expand_tilde(path);
     if p.is_absolute() { p } else { PathBuf::from(cwd).join(p) }
+}
+
+/// Refuse a path in a part of the Obsidian vault the user has closed to narsil.
+pub fn guard(cfg: &Config, path: &std::path::Path) -> Result<()> {
+    if crate::obsidian::Vault::open(cfg).is_some_and(|v| v.closes(path)) {
+        anyhow::bail!(crate::obsidian::closed_message(&path.display().to_string()));
+    }
+    Ok(())
+}
+
+/// The vault, when a walk from `base` could reach into it: what is closed in
+/// it is then left out of the walk.
+pub fn vault_near(cfg: &Config, base: &std::path::Path) -> Option<crate::obsidian::Vault> {
+    crate::obsidian::Vault::open(cfg).filter(|v| v.holds(base) || v.is_under(base))
 }
 
 fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolSpec {
@@ -139,6 +155,19 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
             &[],
         ),
         spec(
+            "change_directory",
+            "Move this session to another directory. Do this first when the task is about a directory \
+             other than the one you are in (\"create it in ~/Code/foo\", \"fix the tests in ../api\"): \
+             afterwards commands start there, relative paths resolve there, and the project's memory, \
+             instructions and work plan are that directory's. Work laid out before moving stays filed \
+             under the old directory, so move before you plan.",
+            json!({
+                "path": { "type": "string" },
+                "create": { "type": "boolean", "description": "Create the directory if it does not exist." }
+            }),
+            &["path"],
+        ),
+        spec(
             "glob",
             "Find files by name pattern, newest first. `*` matches within one directory level and `**` \
              across levels, e.g. `src/**/*.rs`. Respects .gitignore.",
@@ -175,12 +204,20 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
              files do not already state. Scope `task`: working notes for the current task, shared with \
              every agent on it including parallel subagents. Saving with an existing title in the same \
              scope replaces that entry. Call this when the user states a preference or corrects you, and \
-             when you learn something that would otherwise have to be rediscovered.",
+             when you learn something that would otherwise have to be rediscovered. Global and project \
+             entries are Markdown notes the user can open and edit, and they form a graph: write \
+             [[Title of another entry]] in the body wherever one idea bears on another. Prefer several \
+             small linked entries to one long one, and link to an entry that does not exist yet if it \
+             should. Save as you go, not at the end. In particular, the moment an approach fails for a \
+             reason that will still hold next time (the data does not exist, a tool is not installed, a \
+             service needs a key), save it with kind `dead_end`: what you were after, what you tried, why \
+             it failed. Next time that is found before anything is tried. Kind `lesson` is for an \
+             approach that worked and is worth repeating.",
             json!({
-                "title": { "type": "string", "description": "Short and specific; used to find the entry later." },
-                "body": { "type": "string", "description": "The fact itself, and for corrections the reason behind it." },
+                "title": { "type": "string", "description": "Short and specific: the name other entries will link to." },
+                "body": { "type": "string", "description": "The fact itself, and for corrections the reason behind it. Markdown, with [[links]] to related entries." },
                 "scope": { "type": "string", "enum": ["global", "project", "task"] },
-                "kind": { "type": "string", "enum": ["user", "feedback", "project", "reference", "note"] }
+                "kind": { "type": "string", "enum": ["user", "feedback", "project", "reference", "note", "lesson", "dead_end"] }
             }),
             &["title", "body", "scope"],
         ),
@@ -188,7 +225,7 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
             "memory_search",
             "Search memory (global, this project, and this task's shared notes) by keywords. Use it when \
              the question may depend on something learned earlier, and to read notes other agents on \
-             this task have written.",
+             this task have written. Results show what links to each entry.",
             json!({
                 "query": { "type": "string" },
                 "limit": { "type": "integer", "description": "Default 8." }
@@ -196,47 +233,167 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
             &["query"],
         ),
         spec(
+            "memory_read",
+            "Read one memory entry by title, with the entries it links to and the entries that link to \
+             it. This is how to walk the graph: start from a search hit or an entry in your context and \
+             follow its links to related ideas.",
+            json!({ "title": { "type": "string", "description": "The entry's title, or a [[link]] as written." } }),
+            &["title"],
+        ),
+        spec(
             "memory_forget",
-            "Delete a memory entry by id, when it is wrong or no longer true.",
-            json!({ "id": { "type": "integer" } }),
-            &["id"],
+            "Delete a memory entry by title, when it is wrong or no longer true. Its note is removed.",
+            json!({ "title": { "type": "string" } }),
+            &["title"],
         ),
     ];
     v.push(spec(
-        "objectives",
-        "Set the list of objectives for the work in this session, with a status for each. The user sees \
-         this list in a side panel and uses it to follow progress and to jump to the matching point in \
-         the conversation. Call it when you begin work that has more than a couple of steps, to lay out \
-         the objectives; and call it again whenever one is started, finished or dropped. Always send \
-         the complete list, keeping the wording of existing entries unchanged. Keep entries short and \
-         outcome-shaped (what will be true when it is done). Mark `active` only what is being worked \
-         on right now: usually one entry, or several while subagents work on them in parallel.",
+        "work_plan",
+        "Lay out work as items with dependencies. Use it when work has more than a couple of steps, \
+         before starting, and again whenever the plan changes. Each item is an outcome (what will be \
+         true when it is done), small enough to finish and check in one go. `blocked_by` names the \
+         items that must be finished first; items with nothing in their way can be done in parallel. \
+         Something only the user can settle is an item with `question: true`: it waits for them \
+         while the rest proceeds, and blocks only what truly depends on the answer. Items are known \
+         by title, so calling this again with the same titles updates them. The user sees the graph \
+         in a side panel and as notes they can edit.",
         json!({
+            "directory": { "type": "string", "description": "The directory this work is in or will be made in. \".\" when that is the current working directory. If the task names another directory, or the work creates a new project directory, give that path: the session moves there (the directory is made if it does not exist), so commands, this plan and the project's memory all sit with the work." },
+            "root": { "type": "string", "description": "The outcome all the items add up to, in a few words (it becomes a note's name). Give it for anything substantial." },
             "items": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "text": { "type": "string", "description": "The objective, in a few words." },
-                        "status": { "type": "string", "enum": ["pending", "active", "done", "dropped"] }
+                        "title": { "type": "string", "description": "The outcome, in a few words. Other items refer to it by this." },
+                        "description": { "type": "string", "description": "What it involves and anything needed to do it. May link to memory entries with [[Title]]." },
+                        "done_when": { "type": "array", "items": { "type": "string" }, "description": "How to tell it is done: checks that can be run or seen." },
+                        "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Titles of items that must be finished first." },
+                        "parent": { "type": "string", "description": "Title of the item this is a part of, if not the root." },
+                        "question": { "type": "boolean", "description": "True if only the user can settle it." }
                     },
-                    "required": ["text", "status"]
+                    "required": ["title"]
                 }
             }
         }),
-        &["items"],
+        &["directory", "items"],
     ));
+    v.push(spec(
+        "work_next",
+        "See where the work stands: what is ready to do now, what is in progress and by whom, what \
+         waits on the user, and what is blocked by what. Call it when you start, after context was \
+         compacted, and whenever you are unsure what comes next; the answer is always current, \
+         including changes the user made by hand. With `claim`, take a ready item: you get the item, \
+         why it exists, and the results of the items it rests on, which is what you need to begin. \
+         Take one item at a time and finish it before taking another.",
+        json!({
+            "claim": { "type": "string", "description": "Title of a ready item to take." },
+            "show": { "type": "string", "description": "Title of any item, finished ones included, to read in full: what it was, its result and evidence." },
+            "project": { "type": "string", "description": "With `show`: the directory of another project, to read work finished there." }
+        }),
+        &[],
+    ));
+    v.push(spec(
+        "work_done",
+        "Close an item you finished. `result` says what was done and where it is, written for someone \
+         who will build on it without seeing how you did it. `evidence` is how you know: the command \
+         you ran and what it showed, the file, the commit. Check before you close; an item is not done \
+         because the code was written. Work you came across that is not part of this item goes in \
+         `follow_ups` so it is not lost. Answer a question item the same way, with the answer as the result.",
+        json!({
+            "item": { "type": "string", "description": "The item's title." },
+            "result": { "type": "string" },
+            "evidence": { "type": "string" },
+            "follow_ups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "description": { "type": "string" },
+                        "blocked_by": { "type": "array", "items": { "type": "string" } },
+                        "question": { "type": "boolean" }
+                    },
+                    "required": ["title"]
+                }
+            },
+            "learned": {
+                "type": "array",
+                "description": "What you would want to know before doing something like this again. One entry per finding: an approach that worked, or with dead_end true something you tried that failed for a reason that will still hold next time (no such data exists, a tool is missing, a service needs a key). Pass [] only if there is truly nothing.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Specific enough to be found by someone starting a similar task, e.g. `No public data about Eldermoor`." },
+                        "body": { "type": "string", "description": "What you were after, what you did or tried, and why it worked or failed." },
+                        "dead_end": { "type": "boolean" },
+                        "applies": { "type": "string", "enum": ["anywhere", "this project"], "description": "Default anywhere." }
+                    },
+                    "required": ["title", "body"]
+                }
+            }
+        }),
+        &["item", "result", "learned"],
+    ));
+    v.push(spec(
+        "work_update",
+        "Adjust an item without closing it: add a `note` to its log (a finding, a decision, where you \
+         got to), set `status` to `waiting` when it needs the user (say what you need in the note), to \
+         `dropped` when it will not be done (say why), or to `open` to release or reopen it, or add \
+         items it is `blocked_by`.",
+        json!({
+            "item": { "type": "string", "description": "The item's title." },
+            "status": { "type": "string", "enum": ["open", "waiting", "dropped"] },
+            "note": { "type": "string" },
+            "blocked_by": { "type": "array", "items": { "type": "string" } }
+        }),
+        &["item"],
+    ));
+    if !cfg.obsidian.vault.trim().is_empty() {
+        v.push(spec(
+            "vault_search",
+            "Search the user's Obsidian vault (their own notes) by words. Returns the best-matching notes \
+             with the lines that matched. This is the first place to look for anything about the user \
+             (who they are, their work, the people and projects in their life, their plans and decisions) \
+             and for anything they may have written down: search here before the web and before asking them.",
+            json!({
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "description": "Default 10." }
+            }),
+            &["query"],
+        ));
+        v.push(spec(
+            "vault_read",
+            "Read a note from the user's Obsidian vault, with the notes it links to and the notes that \
+             link to it. Name it by path relative to the vault, by note name alone, or as a [[link]]; \
+             `Note#Heading` returns just that section.",
+            json!({ "note": { "type": "string" } }),
+            &["note"],
+        ));
+        v.push(spec(
+            "vault_write",
+            "Write a note in the user's Obsidian vault. `create` makes a new note and fails if one is \
+             there; `append` adds to the end of a note (creating it if needed), which is right for logs \
+             and running lists; `replace` rewrites an existing note, so read it first. Use [[links]] to \
+             related notes. Do this when the user asks for something to be written down or kept.",
+            json!({
+                "note": { "type": "string", "description": "Path relative to the vault, e.g. `Projects/House/Survey notes`." },
+                "content": { "type": "string", "description": "Markdown." },
+                "mode": { "type": "string", "enum": ["create", "append", "replace"], "description": "Default create." }
+            }),
+            &["note", "content"],
+        ));
+    }
     if session.depth < cfg.agents.max_depth {
         v.push(spec(
             "spawn_agents",
             "Run several subagents in parallel and wait for all of them. Each gets its own context and the \
              same tools, memory and working directory as you, and returns one final report. Use this \
-             for independent pieces of work: research across separate areas, changes to unrelated \
-             files, parallel investigations. Each task description is all a subagent knows, so make it \
+             for independent pieces of work: several ready work items, research across separate areas, \
+             changes to unrelated files. Each task description is all a subagent knows, so make it \
              self-contained: the goal, the relevant paths, and what to report back. Do not use it for \
-             work that is quick to do yourself or whose parts depend on each other. The user watches \
-             each subagent live, by name: what it is doing and how it ended. When a subagent's work \
-             serves one of your objectives, name that objective so the user sees the agent under it.",
+             work that is quick to do yourself or whose parts depend on each other. Give a subagent a \
+             ready work item with `work`: it takes the item, is handed what the item rests on, and \
+             closes it with its result, and the user sees it under that item as it works.",
             json!({
                 "agents": {
                     "type": "array",
@@ -245,9 +402,9 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
                         "properties": {
                             "name": { "type": "string", "description": "Short label the user will see, e.g. `api-survey`." },
                             "task": { "type": "string", "description": "Complete, self-contained instructions." },
-                            "objective": {
+                            "work": {
                                 "type": "string",
-                                "description": "The entry of your objectives list this agent works on, copied exactly. Omit if it serves none."
+                                "description": "Title of the ready work item this agent takes. Omit if its task is not one."
                             }
                         },
                         "required": ["name", "task"]
@@ -270,15 +427,45 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
             "goal_complete",
             "Mark the goal as achieved. Call this only after verifying the result. The summary is what the \
              user reads first: say what was done, where it is, and how you verified it.",
-            json!({ "summary": { "type": "string" } }),
-            &["summary"],
+            json!({
+                "summary": { "type": "string" },
+                "lessons": {
+                "type": "array",
+                "description": "What you would want to know before doing something like this again. One entry per finding: an approach that worked, or with dead_end true something you tried that failed for a reason that will still hold next time (no such data exists, a tool is missing, a service needs a key). Pass [] only if there is truly nothing.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Specific enough to be found by someone starting a similar task, e.g. `No public data about Eldermoor`." },
+                        "body": { "type": "string", "description": "What you were after, what you did or tried, and why it worked or failed." },
+                        "dead_end": { "type": "boolean" },
+                        "applies": { "type": "string", "enum": ["anywhere", "this project"], "description": "Default anywhere." }
+                    },
+                    "required": ["title", "body"]
+                }
+            }
+            }),
+            &["summary", "lessons"],
         ));
         v.push(spec(
             "goal_blocked",
             "Stop the goal because it cannot proceed without the user. State exactly what you need from \
              them. Do not use this for obstacles you can work around.",
-            json!({ "reason": { "type": "string" } }),
-            &["reason"],
+            json!({
+                "reason": { "type": "string" },
+                "dead_ends": {
+                    "type": "array",
+                    "description": "What you tried that failed for a reason that will still hold next time (the data does not exist, a source is gone, a key is missing), so that nobody tries it again. Empty if there was none.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "description": "Specific enough to be found by someone starting a similar task, e.g. `No public data about Eldermoor`." },
+                            "body": { "type": "string", "description": "What you were after, what you tried, and why it failed." }
+                        },
+                        "required": ["title", "body"]
+                    }
+                }
+            }),
+            &["reason", "dead_ends"],
         ));
     }
     v
@@ -301,7 +488,7 @@ fn is_allowlisted(command: &str, cfg: &Config) -> bool {
 pub fn needs_approval(name: &str, input: &Value, cfg: &Config) -> bool {
     match name {
         "bash" => !is_allowlisted(input.get("command").and_then(Value::as_str).unwrap_or(""), cfg),
-        "write_file" | "edit_file" => true,
+        "write_file" | "edit_file" | "vault_write" => true,
         _ => false,
     }
 }
@@ -311,7 +498,7 @@ pub fn summarize_call(name: &str, input: &Value) -> String {
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
     match name {
         "bash" => first_line(s("command"), 200),
-        "read_file" | "write_file" | "edit_file" | "list_dir" => s("path").to_string(),
+        "read_file" | "write_file" | "edit_file" | "list_dir" | "change_directory" => s("path").to_string(),
         "glob" => s("pattern").to_string(),
         "grep" => {
             let path = s("path");
@@ -320,22 +507,27 @@ pub fn summarize_call(name: &str, input: &Value) -> String {
         "web_fetch" => s("url").to_string(),
         "memory_save" => format!("[{}] {}", s("scope"), s("title")),
         "memory_search" => s("query").to_string(),
+        "memory_read" | "memory_forget" => s("title").to_string(),
+        "vault_search" => s("query").to_string(),
+        "vault_read" => s("note").to_string(),
+        "vault_write" => format!("{} ({})", s("note"), if s("mode").is_empty() { "create" } else { s("mode") }),
         "spawn_agents" => input
             .get("agents")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|x| x.get("name").and_then(Value::as_str)).collect::<Vec<_>>().join(", "))
             .unwrap_or_default(),
-        "objectives" => {
-            let items = input.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
-            let count = |st: &str| items.iter().filter(|i| i.get("status").and_then(Value::as_str) == Some(st)).count();
-            let active = items
-                .iter()
-                .find(|i| i.get("status").and_then(Value::as_str) == Some("active"))
-                .and_then(|i| i.get("text").and_then(Value::as_str))
-                .map(|t| format!(", now: {}", first_line(t, 80)))
-                .unwrap_or_default();
-            format!("{} of {} done{active}", count("done"), items.len())
+        "work_plan" => {
+            let n = input.get("items").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            let root = s("root");
+            format!("{n} item{}{}", if n == 1 { "" } else { "s" }, if root.is_empty() { String::new() } else { format!(" under {root}") })
         }
+        "work_next" => match (s("claim"), s("show")) {
+            ("", "") => "what is ready?".to_string(),
+            ("", show) => format!("show: {show}"),
+            (claim, _) => format!("take: {claim}"),
+        },
+        "work_done" => format!("{}: {}", s("item"), first_line(s("result"), 120)),
+        "work_update" => format!("{}{}", s("item"), if s("status").is_empty() { String::new() } else { format!(" -> {}", s("status")) }),
         "goal_update" => first_line(s("note"), 200),
         "goal_complete" => first_line(s("summary"), 200),
         "goal_blocked" => first_line(s("reason"), 200),
@@ -355,6 +547,16 @@ pub fn describe_call(name: &str, input: &Value) -> String {
                 s("path"),
                 content.lines().count(),
                 content.len(),
+                truncate_middle(content, 1200)
+            )
+        }
+        "vault_write" => {
+            let content = s("content");
+            format!(
+                "{} in the Obsidian vault, mode {}\n({} lines)\n{}",
+                s("note"),
+                if s("mode").is_empty() { "create" } else { s("mode") },
+                content.lines().count(),
                 truncate_middle(content, 1200)
             )
         }
@@ -380,14 +582,22 @@ pub async fn execute(ctx: &ToolCtx<'_>) -> ToolOutput {
         "write_file" => fs::write_file(ctx).await,
         "edit_file" => fs::edit_file(ctx).await,
         "list_dir" => fs::list_dir(ctx).await,
+        "change_directory" => misc::change_directory(ctx),
         "glob" => fs::glob(ctx).await,
         "grep" => fs::grep(ctx).await,
         "web_fetch" => misc::web_fetch(ctx).await,
         "memory_save" => misc::memory_save(ctx),
         "memory_search" => misc::memory_search(ctx),
         "memory_forget" => misc::memory_forget(ctx),
+        "memory_read" => misc::memory_read(ctx),
+        "vault_search" => vault::vault_search(ctx).await,
+        "vault_read" => vault::vault_read(ctx).await,
+        "vault_write" => vault::vault_write(ctx).await,
         "spawn_agents" => agents::spawn_agents(ctx).await,
-        "objectives" => misc::objectives(ctx),
+        "work_plan" => work::work_plan(ctx),
+        "work_next" => work::work_next(ctx),
+        "work_done" => work::work_done(ctx),
+        "work_update" => work::work_update(ctx),
         "goal_update" | "goal_complete" | "goal_blocked" => misc::goal_tool(ctx),
         other => Ok(ToolOutput::err(format!("unknown tool: {other}"))),
     };

@@ -111,6 +111,150 @@ pub struct Config {
     pub voice: VoiceConfig,
     pub notify: NotifyConfig,
     pub tui: TuiConfig,
+    pub obsidian: ObsidianConfig,
+    pub memory: MemoryConfig,
+    pub telemetry: TelemetryConfig,
+    pub keys: KeysConfig,
+}
+
+/// Key bindings in the TUI. A binding is modifiers and a key joined by `+`
+/// (`ctrl+t`, `alt+right`, `f1`); several for one action are separated by spaces.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct KeysConfig {
+    pub new_tab: String,
+    pub close_tab: String,
+    pub next_tab: String,
+    pub prev_tab: String,
+    /// Pressed before a digit to go straight to that tab. Two keystrokes, but
+    /// no terminal keeps this for itself.
+    pub goto_tab: String,
+    /// A modifier that, held with a digit, also goes to that tab: `alt`,
+    /// `ctrl`, or `none`. Off by default: many terminals take alt+digit for
+    /// their own tabs, and ctrl+digit does not reach a program in most.
+    pub goto_tab_with: String,
+    pub keys: String,
+    pub interrupt: String,
+    pub panel: String,
+    pub expand_tools: String,
+    pub thinking: String,
+    pub voice: String,
+    pub scroll_up: String,
+    pub scroll_down: String,
+    pub quit: String,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        KeysConfig {
+            new_tab: "ctrl+t".into(),
+            close_tab: "alt+w".into(),
+            next_tab: "alt+right".into(),
+            prev_tab: "alt+left".into(),
+            goto_tab: "ctrl+g".into(),
+            goto_tab_with: "none".into(),
+            keys: "f1 alt+k".into(),
+            interrupt: "esc".into(),
+            panel: "tab".into(),
+            expand_tools: "ctrl+o".into(),
+            thinking: "alt+t".into(),
+            voice: "f2".into(),
+            scroll_up: "pageup".into(),
+            scroll_down: "pagedown".into(),
+            quit: "ctrl+d".into(),
+        }
+    }
+}
+
+impl KeysConfig {
+    /// The binding for an action, by its name in `[keys]`.
+    pub fn get(&self, name: &str) -> &str {
+        match name {
+            "new_tab" => &self.new_tab,
+            "close_tab" => &self.close_tab,
+            "next_tab" => &self.next_tab,
+            "prev_tab" => &self.prev_tab,
+            "goto_tab" => &self.goto_tab,
+            "keys" => &self.keys,
+            "interrupt" => &self.interrupt,
+            "panel" => &self.panel,
+            "expand_tools" => &self.expand_tools,
+            "thinking" => &self.thinking,
+            "voice" => &self.voice,
+            "scroll_up" => &self.scroll_up,
+            "scroll_down" => &self.scroll_down,
+            "quit" => &self.quit,
+            _ => "",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    /// How much goes to the log: error, warn, info, debug or trace. Also accepts
+    /// a filter such as `info,narsil::provider=debug`. `NARSIL_LOG` overrides it.
+    pub level: String,
+    /// `text`, or `json` for one JSON object per line.
+    pub log_format: String,
+    /// How long recorded spans (the data behind `narsil trace` and `narsil stats`) are kept.
+    pub keep_days: i64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        TelemetryConfig { level: "info".into(), log_format: "text".into(), keep_days: 30 }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Folder for the memory notes. Empty: `memory` in narsil's data directory.
+    /// Not used while memory is kept in an Obsidian vault.
+    pub dir: String,
+    /// How often, in seconds, the daemon looks at the memory and work notes
+    /// for changes made by hand (an answer written into a question's note, say).
+    pub rescan_secs: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig { dir: String::new(), rescan_secs: 20 }
+    }
+}
+
+/// Optional link to an Obsidian vault. Off while `vault` is empty.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ObsidianConfig {
+    /// Path of the vault folder.
+    pub vault: String,
+    /// Folder inside the vault for narsil's own notes.
+    pub folder: String,
+    /// Keep the memory notes in the vault, under `<folder>/Memory`.
+    pub memory_in_vault: bool,
+    /// Keep a note per goal with its status, its work items and its progress.
+    pub goal_notes: bool,
+    /// Parts of the vault narsil must not read, search or write: folder or note
+    /// names, paths from the top of the vault, or glob patterns.
+    pub exclude: Vec<String>,
+    /// When a request arrives, look in the vault for notes on its subject and
+    /// name the best matches to the agent before it starts.
+    pub lookup: bool,
+}
+
+impl Default for ObsidianConfig {
+    fn default() -> Self {
+        ObsidianConfig {
+            vault: String::new(),
+            folder: "narsil".into(),
+            memory_in_vault: true,
+            goal_notes: true,
+            exclude: Vec::new(),
+            lookup: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -578,7 +722,61 @@ pub fn render_config(c: &Config) -> String {
 
     s.push_str("[tui]\n");
     s.push_str(&format!("mouse = {}\n", c.tui.mouse));
-    s.push_str(&format!("show_thinking = {}\n", c.tui.show_thinking));
+    s.push_str(&format!("show_thinking = {}\n\n", c.tui.show_thinking));
+
+    s.push_str("[obsidian]\n");
+    s.push_str("# Path of an Obsidian vault. Empty: no integration. With a vault set, the agent can\n");
+    s.push_str("# search, read and write its notes (vault_search, vault_read, vault_write).\n");
+    s.push_str(&format!("vault = {}\n", q(&c.obsidian.vault)));
+    s.push_str("# Folder inside the vault where narsil keeps its own notes.\n");
+    s.push_str(&format!("folder = {}\n", q(&c.obsidian.folder)));
+    s.push_str("# Keep the memory notes in the vault, under <folder>/Memory, so they sit in your graph\n");
+    s.push_str("# next to your own notes. false: memory stays in [memory] dir.\n");
+    s.push_str(&format!("memory_in_vault = {}\n", c.obsidian.memory_in_vault));
+    s.push_str("# Keep a note per goal in <folder>/Goals with its status, its work items and its progress.\n");
+    s.push_str(&format!("goal_notes = {}\n", c.obsidian.goal_notes));
+    s.push_str("# Parts of the vault narsil must not read, search or write. A bare name (\"Journal\") closes a\n");
+    s.push_str("# folder or note of that name wherever it is; a path (\"Areas/Health\") is taken from the top of\n");
+    s.push_str("# the vault; * and ? are wildcards (\"*.private.md\"). This holds for narsil's vault and file\n");
+    s.push_str("# tools, and shell commands are refused on the vault while anything is listed here. It is a\n");
+    s.push_str("# guard against the agent wandering, not a sandbox: see docs/obsidian.md.\n");
+    s.push_str(&format!("exclude = [{}]\n", c.obsidian.exclude.iter().map(|e| q(e)).collect::<Vec<_>>().join(", ")));
+    s.push_str("# When you ask for something, look in the vault for notes on the subject and name the best\n");
+    s.push_str("# matches to the agent, so that what you have written down is the first place it looks.\n");
+    s.push_str(&format!("lookup = {}\n\n", c.obsidian.lookup));
+
+    s.push_str("[memory]\n");
+    s.push_str("# Memory is a folder of Markdown notes that link to each other with [[Title]]. Edit,\n");
+    s.push_str("# add or delete notes there with any editor and narsil follows. Empty: the `memory`\n");
+    s.push_str("# folder in narsil's data directory (`narsil config path` shows it).\n");
+    s.push_str(&format!("dir = {}\n", q(&c.memory.dir)));
+    s.push_str("# How often, in seconds, the notes are looked at for changes made by hand.\n");
+    s.push_str(&format!("rescan_secs = {}\n\n", c.memory.rescan_secs));
+
+    s.push_str("[telemetry]\n");
+    s.push_str("# What goes to the daemon log: error, warn, info, debug or trace, or a filter such as\n");
+    s.push_str("# \"info,narsil::provider=debug\". The NARSIL_LOG environment variable overrides it.\n");
+    s.push_str(&format!("level = {}\n", q(&c.telemetry.level)));
+    s.push_str("# \"text\", or \"json\" for one JSON object per line.\n");
+    s.push_str(&format!("log_format = {}\n", q(&c.telemetry.log_format)));
+    s.push_str("# Every session run, model call and tool call is recorded with its timing; `narsil trace`\n");
+    s.push_str("# and `narsil stats` read that. Days to keep it.\n");
+    s.push_str(&format!("keep_days = {}\n\n", c.telemetry.keep_days));
+
+    s.push_str("[keys]\n");
+    s.push_str("# Key bindings in the TUI. A binding is modifiers (ctrl, alt, shift) and a key joined by +,\n");
+    s.push_str("# such as \"ctrl+t\", \"alt+right\" or \"f1\"; several for one action are separated by spaces.\n");
+    s.push_str("# The keys window in the TUI (f1, or /keys) lists what is in force. Editing keys are fixed.\n");
+    for name in [
+        "new_tab", "close_tab", "next_tab", "prev_tab", "goto_tab", "keys", "interrupt", "panel", "expand_tools", "thinking", "voice",
+        "scroll_up", "scroll_down", "quit",
+    ] {
+        s.push_str(&format!("{name} = {}\n", q(c.keys.get(name))));
+    }
+    s.push_str("# goto_tab is pressed before a digit: ctrl+g then 3 goes to tab 3 (also left/right, t new, w close).\n");
+    s.push_str("# goto_tab_with is a modifier that, held with a digit, does the same in one stroke: \"alt\" or \"ctrl\".\n");
+    s.push_str("# It is off because many terminals (Ptyxis, GNOME Terminal, Ghostty) keep alt+digit for their own tabs.\n");
+    s.push_str(&format!("goto_tab_with = {}\n", q(&c.keys.goto_tab_with)));
     s
 }
 

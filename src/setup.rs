@@ -22,6 +22,8 @@ pub struct SetupOpts {
     pub model: Option<String>,
     pub yes: bool,
     pub no_test: bool,
+    /// A vault folder, or `none`.
+    pub obsidian: Option<String>,
 }
 
 struct Preset {
@@ -254,6 +256,20 @@ pub async fn run(paths: &Paths, opts: SetupOpts) -> Result<()> {
         setup_privilege(&mut cfg, paths)?;
     }
 
+    // 6. Obsidian
+    match opts.obsidian.as_deref().map(str::trim) {
+        Some("none") | Some("off") | Some("") => cfg.obsidian.vault.clear(),
+        Some(path) => {
+            let dir = crate::util::expand_tilde(path);
+            if !dir.is_dir() {
+                println!("note: {} is not there right now; saved anyway, and used once it appears", dir.display());
+            }
+            cfg.obsidian.vault = path.to_string();
+        }
+        None if interactive => setup_obsidian(&mut cfg)?,
+        None => {}
+    }
+
     cfg.save(paths)?;
     let written = write_default_guidance(paths)?;
     println!("\nSaved {}", paths.config_file().display());
@@ -300,6 +316,37 @@ fn passwordless_sudo() -> bool {
 /// Sudo for the agent. Being in `wheel` lets the account use sudo at all; a
 /// passwordless rule is what lets an unattended run use it, since the agent
 /// has no terminal and nobody is there to type a password.
+/// Offer the vaults Obsidian knows about. With one chosen, the agent can use
+/// the user's notes and narsil's memory notes live inside the vault.
+fn setup_obsidian(cfg: &mut Config) -> Result<()> {
+    let mut vaults = crate::obsidian::known_vaults();
+    let current = cfg.obsidian.vault.trim().to_string();
+    if !current.is_empty() && !vaults.iter().any(|v| v.to_string_lossy() == current) {
+        vaults.insert(0, std::path::PathBuf::from(&current));
+    }
+    let mut items = vec!["No Obsidian integration (memory notes stay in narsil's own folder)".to_string()];
+    items.extend(vaults.iter().map(|v| {
+        let away = if v.is_dir() { "" } else { "  (not reachable right now)" };
+        format!("{}{away}", v.display())
+    }));
+    items.push("Another folder…".to_string());
+    let default = vaults.iter().position(|v| v.to_string_lossy() == current).map(|i| i + 1).unwrap_or(0);
+    println!(
+        "\nObsidian: with a vault chosen, the agent can search, read and write your notes, and narsil keeps \
+         its memory notes and a note per goal inside the vault, in a `{}` folder.",
+        cfg.obsidian.folder
+    );
+    let i = Select::with_theme(&theme()).with_prompt("Obsidian vault").items(&items).default(default).interact()?;
+    cfg.obsidian.vault = if i == 0 {
+        String::new()
+    } else if i <= vaults.len() {
+        vaults[i - 1].to_string_lossy().into_owned()
+    } else {
+        Input::<String>::with_theme(&theme()).with_prompt("Vault folder").interact_text()?.trim().to_string()
+    };
+    Ok(())
+}
+
 fn setup_privilege(cfg: &mut Config, paths: &Paths) -> Result<()> {
     let user = util::current_user();
     println!();

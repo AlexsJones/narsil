@@ -43,7 +43,19 @@ fn lock_pid_file(paths: &Paths) -> Result<std::fs::File> {
 fn recover(engine: &Arc<Engine>) -> Result<()> {
     let crashed = engine.store.mark_running_as_interrupted()?;
     if !crashed.is_empty() {
-        logln!("recovery: {} session(s) were running when the previous daemon died", crashed.len());
+        tracing::warn!("recovery: {} session(s) were running when the previous daemon died", crashed.len());
+    }
+    // A command the dead daemon started has nobody watching it. Stop it now,
+    // not only when its session is continued, which for a chat may be never.
+    let mut stopped = 0;
+    for (rowid, name, state) in engine.store.running_tool_states()? {
+        if name == "bash" && crate::tools::shell::kill_orphan(&state) {
+            engine.store.tool_call_mark_stopped(rowid)?;
+            stopped += 1;
+        }
+    }
+    if stopped > 0 {
+        tracing::warn!("recovery: stopped {stopped} command(s) left running by the previous daemon");
     }
     let interrupted = engine.store.interrupted_sessions()?;
     let resume_chats = engine.cfg().daemon.resume_interrupted_chats;
@@ -52,10 +64,10 @@ fn recover(engine: &Arc<Engine>) -> Result<()> {
             // Goals are restarted by the supervisor; subagents by their parent's tool call.
             "goal" | "subagent" => {}
             _ if resume_chats => {
-                logln!("recovery: resuming chat session {} ({})", s.id, first_line(&s.title, 60));
+                tracing::info!(session = %s.id, "recovery: resuming this chat session ({})", first_line(&s.title, 60));
                 engine.start_run(&s.id);
             }
-            _ => logln!("recovery: chat session {} is waiting for /continue ({})", s.id, first_line(&s.title, 60)),
+            _ => tracing::info!(session = %s.id, "recovery: this chat session is waiting for /continue ({})", first_line(&s.title, 60)),
         }
     }
     Ok(())
@@ -66,6 +78,9 @@ pub async fn run(paths: Paths) -> Result<()> {
     let _lock = lock_pid_file(&paths)?;
     let cfg = Config::load(&paths)?;
     let store = Store::open(&paths.db_file())?;
+    // After the database is open, because recorded spans go into it.
+    let telemetry = crate::telemetry::init(crate::telemetry::Role::Daemon, &paths, &cfg);
+    crate::telemetry::log_panics();
     let engine = Engine::new(paths.clone(), cfg, store);
     logln!("narsil daemon {} starting (pid {})", env!("CARGO_PKG_VERSION"), std::process::id());
     if !engine.cfg().is_configured() {
@@ -81,6 +96,17 @@ pub async fn run(paths: Paths) -> Result<()> {
 
     let shutdown = CancellationToken::new();
     let supervisor = tokio::spawn(goals::supervise(engine.clone(), shutdown.clone()));
+    tokio::spawn(watch_memory(engine.clone(), shutdown.clone()));
+    // A vault on a network drive takes seconds to read through cold. Do it now,
+    // out of the way, so the first request does not wait for it.
+    let cfg = engine.cfg();
+    tokio::task::spawn_blocking(move || {
+        if let Some(vault) = crate::obsidian::Vault::open(&cfg) {
+            let began = Instant::now();
+            let n = vault.warm();
+            tracing::info!("obsidian: read {n} notes in {} ms", began.elapsed().as_millis());
+        }
+    });
     let started = Instant::now();
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -92,7 +118,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                 Ok((stream, _)) => {
                     tokio::spawn(serve_client(engine.clone(), stream, shutdown.clone(), started));
                 }
-                Err(e) => logln!("accept failed: {e}"),
+                Err(e) => tracing::warn!("accept failed: {e}"),
             },
             _ = sigterm.recv() => { logln!("SIGTERM"); break; }
             _ = sigint.recv() => { logln!("SIGINT"); break; }
@@ -107,7 +133,56 @@ pub async fn run(paths: Paths) -> Result<()> {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(paths.pid_file());
     logln!("stopped");
+    telemetry.flush();
     Ok(())
+}
+
+/// Keep the memory index in step with the notes: pick up edits made in an
+/// editor, and write out entries held while the folder was away. Says what it
+/// did, and says a problem once rather than every pass.
+async fn watch_memory(engine: Arc<Engine>, shutdown: CancellationToken) {
+    let mut last_said = String::new();
+    loop {
+        let pass = {
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || crate::memory::refresh(&engine.store, &engine.cfg(), &engine.paths)).await
+        };
+        if let Ok(r) = pass {
+            if r.changed() {
+                logln!("memory: {}", r.summary());
+            }
+            // The work notes too: an item edited or added by hand reaches whoever is watching.
+            let work = {
+                let engine = engine.clone();
+                tokio::task::spawn_blocking(move || crate::work::refresh(&engine.store, &engine.cfg(), &engine.paths)).await
+            };
+            let mut work_trouble = String::new();
+            if let Ok(w) = work {
+                if w.changed() {
+                    logln!("work: {} notes read, {} removed, {} held changes written", w.indexed, w.removed, w.flushed);
+                }
+                for project in &w.projects {
+                    engine.emit_work(project);
+                }
+                goals::resume_answered(&engine);
+                work_trouble = if w.available { w.problems.join("; ") } else { w.why.clone() };
+            }
+            let trouble = if r.available { r.problems.join("; ") } else { r.why.clone() };
+            let trouble = [trouble, work_trouble].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("; ");
+            if trouble != last_said {
+                if !trouble.is_empty() {
+                    tracing::warn!("notes: {trouble}");
+                } else if !last_said.is_empty() {
+                    logln!("notes: the folders are reachable again and nothing is wrong with them");
+                }
+                last_said = trouble;
+            }
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(engine.cfg().memory.rescan_secs.clamp(1, 3600))) => {}
+        }
+    }
 }
 
 async fn serve_client(engine: Arc<Engine>, stream: UnixStream, shutdown: CancellationToken, started: Instant) {
@@ -189,6 +264,23 @@ async fn handle(
     started: Instant,
 ) -> Result<Value> {
     let store = &engine.store;
+    if !matches!(cmd, Command::Ping) {
+        // The command's name and whose it is about, not its contents: those can be a whole prompt.
+        let name = format!("{cmd:?}");
+        let (session, goal) = match &cmd {
+            Command::SessionGet { id } | Command::Attach { id } => (id.as_str(), ""),
+            Command::Send { session, .. }
+            | Command::Interrupt { session }
+            | Command::Resume { session }
+            | Command::SetMode { session, .. }
+            | Command::SetModel { session, .. }
+            | Command::SetDir { session, .. }
+            | Command::Compact { session } => (session.as_str(), ""),
+            Command::GoalAction { id, .. } => ("", id.as_str()),
+            _ => ("", ""),
+        };
+        tracing::debug!(session, goal, command = name.split([' ', '{', '(']).next().unwrap_or(""), "request from a client");
+    }
     match cmd {
         Command::Ping => Ok(json!({ "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id() })),
         Command::Status => {
@@ -200,6 +292,7 @@ async fn handle(
                 "model": cfg.model.default,
                 "running": engine.running_sessions(),
                 "goals": store.goal_list(false)?,
+                "doing": store.spans_open()?,
             }))
         }
         Command::Shutdown => {
@@ -226,7 +319,8 @@ async fn handle(
                 "approvals": engine.pending_approvals(&session.root_id),
                 "running": engine.is_running(&id),
                 "queued": store.pending_count(&id)?,
-                "objectives": store.objectives_get(&id)?,
+                "work": crate::work::load(store, Some(&crate::context::project_dir(&session.cwd)))?,
+                "work_anchors": crate::work::anchors(store, &id)?,
                 "agents": engine.agents(&session.root_id),
                 "goal": goal,
                 "session": session,
@@ -301,6 +395,15 @@ async fn handle(
             engine.switch_model(&id, model.trim())?;
             Ok(Value::Null)
         }
+        Command::SetDir { session, dir } => {
+            let id = store.resolve_session(&session)?;
+            if engine.is_running(&id) {
+                bail!("the session is busy; change directory between turns");
+            }
+            let now = engine.change_directory(&id, &dir, false, true)?;
+            engine.emit_work(&crate::context::project_dir(&now));
+            Ok(json!({ "cwd": now }))
+        }
         Command::Models => {
             let cfg = engine.cfg();
             Ok(json!({
@@ -328,20 +431,11 @@ async fn handle(
             let model = engine.default_model(model)?;
             let goal = store.goal_create(objective.trim(), &cwd, &model)?;
             engine.emit_global(Event::Goal { goal: goal.clone() });
-            // Create the session right away so a client can attach to it.
-            let cfg = engine.cfg();
-            let session = store.create_session(crate::store::NewSession {
-                goal_id: Some(goal.id.clone()),
-                kind: "goal".into(),
-                title: format!("goal: {}", first_line(&goal.objective, 60)),
-                cwd: goal.cwd.clone(),
-                model,
-                perm_mode: cfg.permissions.goal_mode.clone(),
-                ..Default::default()
-            })?;
-            let brief = [crate::types::Block::Text { text: crate::context::goal_brief(&goal.id, &goal.objective) }];
-            store.append_message(&session.id, crate::types::Role::User, crate::types::MsgKind::Message, &brief)?;
-            store.goal_set_session(&goal.id, &session.id)?;
+            // Create the session right away so a client can attach to it. That also puts
+            // what memory already holds on the subject in front of it, before the first step.
+            let sid = goals::ensure_session(&engine, &goal)?;
+            let session = store.require_session(&sid)?;
+            engine.write_goal_note(&goal.id);
             let goal = store.goal_get(&goal.id)?.ok_or_else(|| anyhow!("goal vanished"))?;
             Ok(json!({ "goal": goal, "session": session }))
         }

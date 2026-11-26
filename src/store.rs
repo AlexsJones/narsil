@@ -4,14 +4,20 @@
 //!   sessions / messages   append-only transcripts (episodic memory)
 //!   tool_calls            write-ahead journal of tool execution
 //!   pending_inputs        user messages waiting to be delivered to a running agent
-//!   memories              durable facts (global, per project) and per-task notes
+//!   memories              search index over the memory notes, and per-task notes
 //!   goals / goal_log      autonomous objectives and their progress journal
-//!   objectives            a session's plan, entry by entry
+//!   work_items / _edges   index of the work notes: what is ready, who holds what
+//!   work_events           who did what to each work item, and where in which transcript
+//!   spans                 what narsil did and how long it took (telemetry)
 //!   subagents             what each subagent was spawned for and how it ended
 //!
 //! Stop/resume, crash recovery and parallel subagents are all the same thing
 //! from here: an agent's next action is derived from what is in these tables,
 //! so any process that opens the database can pick the work up.
+//!
+//! Durable memory is the exception: its source of truth is a folder of linked
+//! Markdown notes (see `memory.rs`). The `memories` rows for the global and
+//! project scopes are an index of those notes that can be rebuilt from them.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -94,7 +100,20 @@ CREATE TABLE IF NOT EXISTS memories (
     source_session TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    path       TEXT,                        -- the note, relative to the memory folder; NULL: not written yet
+    mtime      INTEGER NOT NULL DEFAULT 0,  -- the note's modification time when it was indexed (ns)
+    pending    INTEGER NOT NULL DEFAULT 0,  -- 1: waiting to be written to the folder; 2: waiting to be removed
     UNIQUE(scope, title)
+);
+-- [[links]] found in each entry, so the notes can be walked as a graph.
+CREATE TABLE IF NOT EXISTS memory_links (
+    from_id INTEGER NOT NULL,
+    target  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_links_from ON memory_links(from_id);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(title, body, content='memories', content_rowid='id');
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -146,6 +165,66 @@ CREATE TABLE IF NOT EXISTS subagents (
     outcome    TEXT NOT NULL DEFAULT '',  -- '' | done | failed | interrupted
     summary    TEXT NOT NULL DEFAULT ''
 );
+
+-- The work graph: an index of the work notes (see `work.rs`), rebuilt from
+-- them like the memory index, plus the record of who did what to each item.
+CREATE TABLE IF NOT EXISTS work_items (
+    id         TEXT PRIMARY KEY,
+    project    TEXT NOT NULL,              -- the directory the work belongs to
+    title      TEXT NOT NULL,
+    status     TEXT NOT NULL,              -- open | in_progress | done | dropped | waiting
+    kind       TEXT NOT NULL DEFAULT 'task', -- task | question
+    parent     TEXT,
+    discovered_from TEXT,
+    goal       TEXT NOT NULL DEFAULT '',
+    body       TEXT NOT NULL DEFAULT '',
+    result     TEXT NOT NULL DEFAULT '',
+    log        TEXT NOT NULL DEFAULT '',
+    claimed_by TEXT NOT NULL DEFAULT '',   -- session id
+    claimed_agent TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    path       TEXT,
+    mtime      INTEGER NOT NULL DEFAULT 0,
+    pending    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(project, title)
+);
+CREATE TABLE IF NOT EXISTS work_edges (
+    item       TEXT NOT NULL,
+    blocked_by TEXT NOT NULL,
+    PRIMARY KEY (item, blocked_by)
+);
+CREATE TABLE IF NOT EXISTS work_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    item       TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    session    TEXT NOT NULL DEFAULT '',
+    message_id INTEGER NOT NULL DEFAULT 0,  -- where in that session's transcript
+    agent      TEXT NOT NULL DEFAULT '',
+    what       TEXT NOT NULL,               -- created | claimed | note | done | dropped | waiting | reopened | edited
+    text       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS work_events_item ON work_events(item, id);
+
+-- What narsil did and how long it took: one row per recorded span (a session
+-- run, a model call, a tool call...). Written by the telemetry recorder as
+-- spans open and close, so a span still open when the daemon died is visible.
+CREATE TABLE IF NOT EXISTS spans (
+    id       INTEGER PRIMARY KEY,
+    parent   INTEGER,                    -- the recorded span this one ran inside
+    root     TEXT NOT NULL DEFAULT '',   -- session tree
+    session  TEXT NOT NULL DEFAULT '',
+    agent    TEXT NOT NULL DEFAULT '',
+    goal     TEXT NOT NULL DEFAULT '',
+    kind     TEXT NOT NULL,              -- session_run | model_call | tool_call | ...
+    what     TEXT NOT NULL DEFAULT '',   -- the model, the tool, ...
+    start_ms INTEGER NOT NULL,           -- unix time
+    dur_ms   INTEGER,                    -- NULL while it is running
+    ok       INTEGER NOT NULL DEFAULT 1,
+    data     TEXT NOT NULL DEFAULT '{}'  -- the span's other fields
+);
+CREATE INDEX IF NOT EXISTS spans_root ON spans(root, start_ms);
+CREATE INDEX IF NOT EXISTS spans_start ON spans(start_ms);
 
 CREATE TABLE IF NOT EXISTS input_history (
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,6 +322,81 @@ pub struct Memory {
     pub body: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The entry's note, relative to the memory folder. None for task notes,
+    /// and for an entry that has not been written to the folder yet.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub mtime: i64,
+    /// 0: in step with its note. 1: waiting to be written. 2: waiting to be removed.
+    #[serde(default)]
+    pub pending: i64,
+}
+
+/// One recorded span: something narsil did, when, and for how long.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SpanRow {
+    pub id: i64,
+    pub parent: Option<i64>,
+    pub root: String,
+    pub session: String,
+    pub agent: String,
+    pub goal: String,
+    pub kind: String,
+    pub what: String,
+    pub start_ms: i64,
+    /// None while the span is still running.
+    pub dur_ms: Option<i64>,
+    pub ok: bool,
+    pub data: Value,
+}
+
+impl SpanRow {
+    /// A number recorded on the span, or 0.
+    pub fn num(&self, key: &str) -> i64 {
+        self.data.get(key).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0)
+    }
+
+    pub fn text(&self, key: &str) -> String {
+        match self.data.get(key) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(v) => v.to_string(),
+        }
+    }
+}
+
+const SPAN_COLS: &str = "id, parent, root, session, agent, goal, kind, what, start_ms, dur_ms, ok, data";
+
+fn span_from(row: &Row) -> rusqlite::Result<SpanRow> {
+    let data: String = row.get(11)?;
+    Ok(SpanRow {
+        id: row.get(0)?,
+        parent: row.get(1)?,
+        root: row.get(2)?,
+        session: row.get(3)?,
+        agent: row.get(4)?,
+        goal: row.get(5)?,
+        kind: row.get(6)?,
+        what: row.get(7)?,
+        start_ms: row.get(8)?,
+        dur_ms: row.get(9)?,
+        ok: row.get::<_, i64>(10)? != 0,
+        data: serde_json::from_str(&data).unwrap_or(Value::Null),
+    })
+}
+
+/// What the index should hold for one entry.
+pub struct IndexEntry<'a> {
+    pub scope: &'a str,
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub path: Option<&'a str>,
+    pub mtime: i64,
+    pub pending: i64,
+    pub updated_at: i64,
+    pub links: &'a [String],
 }
 
 fn memory_from(row: &Row) -> rusqlite::Result<Memory> {
@@ -254,10 +408,14 @@ fn memory_from(row: &Row) -> rusqlite::Result<Memory> {
         body: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        path: row.get(7)?,
+        mtime: row.get(8)?,
+        pending: row.get(9)?,
     })
 }
 
-const MEMORY_COLS: &str = "m.id, m.scope, m.kind, m.title, m.body, m.created_at, m.updated_at";
+const MEMORY_COLS: &str =
+    "m.id, m.scope, m.kind, m.title, m.body, m.created_at, m.updated_at, m.path, m.mtime, m.pending";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Goal {
@@ -288,15 +446,6 @@ fn goal_from(row: &Row) -> rusqlite::Result<Goal> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
     })
-}
-
-/// One entry of a session's plan. `anchor` is the id of the transcript message
-/// in which the entry was added or last changed status, so a UI can jump to it.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Objective {
-    pub text: String,
-    pub status: String, // pending | active | done | dropped
-    pub anchor: i64,
 }
 
 /// A subagent as a UI shows it: who it works for, on what, and how far it is.
@@ -382,6 +531,26 @@ fn tool_call_from(row: &Row) -> rusqlite::Result<ToolCall> {
 
 const TOOL_COLS: &str = "id, message_id, seq, name, input, status, state, result, is_error";
 
+/// Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS`
+/// leaves an existing table alone, so older databases get them here.
+fn migrate(conn: &Connection) -> Result<()> {
+    let added = [
+        ("subagents", "worked", "INTEGER NOT NULL DEFAULT 0"),
+        ("memories", "path", "TEXT"),
+        ("memories", "mtime", "INTEGER NOT NULL DEFAULT 0"),
+        ("memories", "pending", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (table, column, decl) in added {
+        let present: bool = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+            .exists(params![column])?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -397,6 +566,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -404,9 +574,21 @@ impl Store {
     pub fn open_memory() -> Result<Store> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store { conn: Arc::new(Mutex::new(conn)) })
     }
 
+    /// The connection, for modules that keep their own tables here (`work.rs`).
+    /// Hold it briefly, and begin any transaction with `Immediate`.
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.db()
+    }
+
+    // Every transaction here takes the write lock when it begins (`Immediate`).
+    // The default takes it on the first write, and SQLite refuses that upgrade
+    // outright, without waiting, if another connection has written since the
+    // transaction's first read. Other connections do write: the telemetry
+    // recorder, the TUI and the CLI each have their own.
     fn db(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -523,6 +705,24 @@ impl Store {
         Ok(())
     }
 
+    /// Move a session to another directory. Like a change of model, the system
+    /// prompt is rebuilt on the next call: the project's instructions, memory
+    /// and work are those of the new directory.
+    pub fn switch_directory(&self, id: &str, cwd: &str) -> Result<()> {
+        self.db().execute(
+            "UPDATE sessions SET cwd = ?2, system_prompt = '', \
+             strip_thinking_before = (SELECT COALESCE(MAX(m.id), 0) + 1 FROM messages m WHERE m.session_id = ?1) \
+             WHERE id = ?1",
+            params![id, cwd],
+        )?;
+        Ok(())
+    }
+
+    pub fn goal_set_cwd(&self, id: &str, cwd: &str) -> Result<()> {
+        self.db().execute("UPDATE goals SET cwd = ?2 WHERE id = ?1", params![id, cwd])?;
+        Ok(())
+    }
+
     pub fn set_perm_mode(&self, id: &str, mode: &str) -> Result<()> {
         self.db().execute("UPDATE sessions SET perm_mode = ?2 WHERE id = ?1", params![id, mode])?;
         Ok(())
@@ -579,13 +779,15 @@ impl Store {
             i += 1;
         }
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for sid in &ids {
             tx.execute("DELETE FROM messages WHERE session_id = ?1", params![sid])?;
             tx.execute("DELETE FROM tool_calls WHERE session_id = ?1", params![sid])?;
             tx.execute("DELETE FROM pending_inputs WHERE session_id = ?1", params![sid])?;
             tx.execute("DELETE FROM objectives WHERE session_id = ?1", params![sid])?;
             tx.execute("DELETE FROM subagents WHERE session_id = ?1", params![sid])?;
+            tx.execute("DELETE FROM spans WHERE session = ?1", params![sid])?;
+            tx.execute("DELETE FROM work_events WHERE session = ?1", params![sid])?;
             tx.execute("DELETE FROM memories WHERE scope = ?1", params![format!("task:{sid}")])?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
         }
@@ -613,7 +815,7 @@ impl Store {
     pub fn append_assistant(&self, session_id: &str, blocks: &[Block]) -> Result<StoredMessage> {
         let ts = now();
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO messages (session_id, role, kind, blocks, created_at) VALUES (?1,'assistant','message',?2,?3)",
             params![session_id, serde_json::to_string(blocks)?, ts],
@@ -669,7 +871,7 @@ impl Store {
         let ts = now();
         let blocks = vec![Block::Text { text: summary.to_string() }];
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO messages (session_id, role, kind, blocks, created_at) VALUES (?1,'user','compaction',?2,?3)",
             params![session_id, serde_json::to_string(&blocks)?, ts],
@@ -718,6 +920,30 @@ impl Store {
              WHERE session_id = ?1 AND message_id = ?2 AND seq = ?3",
             params![session_id, call.message_id, call.seq, result, is_error as i64, now()],
         )?;
+        Ok(())
+    }
+
+    /// The journaled state of every call still marked as running, with its
+    /// tool: after a crash, what the dead daemon had in hand.
+    pub fn running_tool_states(&self) -> Result<Vec<(i64, String, Value)>> {
+        let db = self.db();
+        let mut stmt =
+            db.prepare("SELECT rowid, name, state FROM tool_calls WHERE status = 'running' AND state IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (rowid, name, state) = row?;
+            if let Ok(state) = serde_json::from_str(&state) {
+                out.push((rowid, name, state));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Note on a journaled call that its command was stopped during recovery,
+    /// so that whoever resumes the session can be told.
+    pub fn tool_call_mark_stopped(&self, rowid: i64) -> Result<()> {
+        self.db().execute("UPDATE tool_calls SET state = json_set(state, '$.stopped', 1) WHERE rowid = ?1", params![rowid])?;
         Ok(())
     }
 
@@ -774,7 +1000,7 @@ impl Store {
     pub fn pending_deliver(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let ts = now();
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let texts: Vec<String> = {
             let mut stmt = tx.prepare("SELECT text FROM pending_inputs WHERE session_id = ?1 ORDER BY id")?;
             stmt.query_map(params![session_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
@@ -824,7 +1050,8 @@ impl Store {
         let (filter, mut vals) = scope_filter(scopes);
         vals.push(SqlValue::Integer(limit));
         let sql = format!(
-            "SELECT {MEMORY_COLS} FROM memories m WHERE {filter} ORDER BY m.updated_at DESC, m.id DESC LIMIT ?"
+            "SELECT {MEMORY_COLS} FROM memories m WHERE {filter} AND m.pending != 2 \
+             ORDER BY m.updated_at DESC, m.id DESC LIMIT ?"
         );
         let mut stmt = db.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(vals.iter()), memory_from)?;
@@ -847,7 +1074,7 @@ impl Store {
             vals.push(SqlValue::Integer(limit));
             let sql = format!(
                 "SELECT {MEMORY_COLS} FROM memories_fts f JOIN memories m ON m.id = f.rowid \
-                 WHERE memories_fts MATCH ? AND {filter} ORDER BY bm25(memories_fts) LIMIT ?"
+                 WHERE memories_fts MATCH ? AND {filter} AND m.pending != 2 ORDER BY bm25(memories_fts) LIMIT ?"
             );
             let mut stmt = db.prepare(&sql)?;
             let found: rusqlite::Result<Vec<Memory>> =
@@ -862,7 +1089,7 @@ impl Store {
         vals.extend(scope_vals);
         vals.push(SqlValue::Integer(limit));
         let sql = format!(
-            "SELECT {MEMORY_COLS} FROM memories m WHERE (m.title LIKE ?1 OR m.body LIKE ?1) AND {filter} \
+            "SELECT {MEMORY_COLS} FROM memories m WHERE (m.title LIKE ?1 OR m.body LIKE ?1) AND {filter} AND m.pending != 2 \
              ORDER BY m.updated_at DESC LIMIT ?"
         );
         let mut stmt = db.prepare(&sql)?;
@@ -870,8 +1097,118 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn memory_get(&self, id: i64) -> Result<Option<Memory>> {
+        let db = self.db();
+        let m = db
+            .query_row(&format!("SELECT {MEMORY_COLS} FROM memories m WHERE m.id = ?1"), params![id], memory_from)
+            .optional()?;
+        Ok(m)
+    }
+
+    /// The entry with this title in one of `scopes`, whatever its capitalisation.
+    pub fn memory_find(&self, scopes: &[String], title: &str) -> Result<Option<Memory>> {
+        let db = self.db();
+        let (filter, scope_vals) = scope_filter(scopes);
+        let mut vals = vec![SqlValue::Text(title.trim().to_string())];
+        vals.extend(scope_vals);
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memories m WHERE m.title = ?1 COLLATE NOCASE AND {filter} AND m.pending != 2 \
+             ORDER BY m.updated_at DESC LIMIT 1"
+        );
+        let m = db.query_row(&sql, params_from_iter(vals.iter()), memory_from).optional()?;
+        Ok(m)
+    }
+
+    /// Global and project memory: everything that outlives a task and lives in a note.
+    pub fn memory_durable(&self) -> Result<Vec<Memory>> {
+        let db = self.db();
+        let mut stmt = db.prepare(&format!(
+            "SELECT {MEMORY_COLS} FROM memories m WHERE m.scope = 'global' OR m.scope LIKE 'project:%' ORDER BY m.id"
+        ))?;
+        let rows = stmt.query_map([], memory_from)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Record what a note holds (or, with `pending`, what one is going to hold),
+    /// replacing the entry with the same scope and title, and its links.
+    pub fn memory_index_put(&self, e: &IndexEntry<'_>) -> Result<i64> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO memories (scope, kind, title, body, created_at, updated_at, path, mtime, pending) \
+             VALUES (?1,?2,?3,?4,?5,?5,?6,?7,?8) \
+             ON CONFLICT(scope, title) DO UPDATE SET kind = excluded.kind, body = excluded.body, \
+             updated_at = excluded.updated_at, path = excluded.path, mtime = excluded.mtime, pending = excluded.pending",
+            params![e.scope, e.kind, e.title, e.body, e.updated_at, e.path, e.mtime, e.pending],
+        )?;
+        let id: i64 = tx.query_row(
+            "SELECT id FROM memories WHERE scope = ?1 AND title = ?2",
+            params![e.scope, e.title],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM memory_links WHERE from_id = ?1", params![id])?;
+        for target in e.links {
+            tx.execute("INSERT INTO memory_links (from_id, target) VALUES (?1,?2)", params![id, target])?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// The entry's note was written: it is in step again.
+    pub fn memory_set_file(&self, id: i64, path: &str, mtime: i64) -> Result<()> {
+        self.db().execute(
+            "UPDATE memories SET path = ?2, mtime = ?3, pending = 0 WHERE id = ?1",
+            params![id, path, mtime],
+        )?;
+        Ok(())
+    }
+
+    pub fn memory_set_pending(&self, id: i64, pending: i64) -> Result<()> {
+        self.db().execute("UPDATE memories SET pending = ?2 WHERE id = ?1", params![id, pending])?;
+        Ok(())
+    }
+
+    /// The memory folder changed: every entry has to be written to the new one.
+    pub fn memory_mark_all_pending(&self) -> Result<usize> {
+        Ok(self.db().execute(
+            "UPDATE memories SET path = NULL, mtime = 0, pending = 1 \
+             WHERE (scope = 'global' OR scope LIKE 'project:%') AND pending != 2",
+            [],
+        )?)
+    }
+
+    /// Titles of the entries in `scopes` that link to `title`.
+    pub fn memory_backlinks(&self, title: &str, scopes: &[String]) -> Result<Vec<String>> {
+        let db = self.db();
+        let (filter, scope_vals) = scope_filter(scopes);
+        let mut vals = vec![SqlValue::Text(title.trim().to_string())];
+        vals.extend(scope_vals);
+        let sql = format!(
+            "SELECT DISTINCT m.title FROM memory_links l JOIN memories m ON m.id = l.from_id \
+             WHERE l.target = ?1 COLLATE NOCASE AND {filter} AND m.pending != 2 ORDER BY m.title"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(vals.iter()), |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn memory_delete(&self, id: i64) -> Result<bool> {
-        Ok(self.db().execute("DELETE FROM memories WHERE id = ?1", params![id])? > 0)
+        let db = self.db();
+        db.execute("DELETE FROM memory_links WHERE from_id = ?1", params![id])?;
+        Ok(db.execute("DELETE FROM memories WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        let db = self.db();
+        Ok(db.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0)).optional()?)
+    }
+
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO meta (key, value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     // ---- goals ------------------------------------------------------------
@@ -944,25 +1281,6 @@ impl Store {
             Ok(GoalLog { ts: r.get(0)?, kind: r.get(1)?, text: r.get(2)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    // ---- objectives -------------------------------------------------------
-
-    pub fn objectives_get(&self, session_id: &str) -> Result<Vec<Objective>> {
-        let db = self.db();
-        let items: Option<String> = db
-            .query_row("SELECT items FROM objectives WHERE session_id = ?1", params![session_id], |r| r.get(0))
-            .optional()?;
-        Ok(items.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
-    }
-
-    pub fn objectives_set(&self, session_id: &str, items: &[Objective]) -> Result<()> {
-        self.db().execute(
-            "INSERT INTO objectives (session_id, items, updated_at) VALUES (?1,?2,?3) \
-             ON CONFLICT(session_id) DO UPDATE SET items = excluded.items, updated_at = excluded.updated_at",
-            params![session_id, serde_json::to_string(items)?, now()],
-        )?;
-        Ok(())
     }
 
     // ---- subagents --------------------------------------------------------
@@ -1060,6 +1378,37 @@ impl Store {
             )
             .optional()?;
         Ok(found.map(|(name, input)| (name, serde_json::from_str(&input).unwrap_or(Value::Null))))
+    }
+
+    // ---- recorded spans ---------------------------------------------------
+
+    fn spans_where(&self, filter: &str, args: &[SqlValue]) -> Result<Vec<SpanRow>> {
+        let db = self.db();
+        let mut stmt = db.prepare(&format!("SELECT {SPAN_COLS} FROM spans WHERE {filter} ORDER BY start_ms, id"))?;
+        let rows = stmt.query_map(params_from_iter(args.iter()), span_from)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Everything recorded for one session tree, oldest first.
+    pub fn spans_for_root(&self, root: &str) -> Result<Vec<SpanRow>> {
+        self.spans_where("root = ?1", &[SqlValue::Text(root.to_string())])
+    }
+
+    pub fn spans_since(&self, start_ms: i64) -> Result<Vec<SpanRow>> {
+        self.spans_where("start_ms >= ?1", &[SqlValue::Integer(start_ms)])
+    }
+
+    /// What is in flight right now.
+    pub fn spans_open(&self) -> Result<Vec<SpanRow>> {
+        self.spans_where("dur_ms IS NULL", &[])
+    }
+
+    /// The session tree that most recently did anything.
+    pub fn latest_span_root(&self) -> Result<Option<String>> {
+        let db = self.db();
+        Ok(db
+            .query_row("SELECT root FROM spans WHERE root != '' ORDER BY start_ms DESC, id DESC LIMIT 1", [], |r| r.get(0))
+            .optional()?)
     }
 
     // ---- input history ----------------------------------------------------

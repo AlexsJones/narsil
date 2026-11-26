@@ -138,8 +138,17 @@ pub async fn status(paths: &Paths) -> Result<()> {
     );
     let model = st["model"].as_str().unwrap_or("");
     println!("  model:    {}", if model.is_empty() { "(not configured; run `narsil setup`)" } else { model });
-    let running = st["running"].as_array().map(|a| a.len()).unwrap_or(0);
-    println!("  running:  {running} session(s)");
+    let running: Vec<&str> = st["running"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    println!("  running:  {} session(s){}", running.len(), if running.is_empty() { String::new() } else { format!(": {}", running.join(", ")) });
+    // What is in flight this moment, innermost steps only: a model call, a tool, a wait.
+    let doing: Vec<crate::store::SpanRow> = serde_json::from_value(st["doing"].clone()).unwrap_or_default();
+    let now = crate::telemetry::now_ms();
+    for s in doing.iter().filter(|s| !doing.iter().any(|other| other.parent == Some(s.id))) {
+        // Named as in the log, so the same id finds it there: session, or session>subagent name, and the goal.
+        let who = crate::telemetry::Who::of(s);
+        let what = util::first_line(&format!("{} {} {}", s.kind.replace('_', " "), s.what, s.text("summary")), 70);
+        println!("  now:      [{who}] {} for {}", what.trim(), crate::telemetry::fmt_ms(now - s.start_ms));
+    }
     let goals = st["goals"].as_array().cloned().unwrap_or_default();
     if goals.is_empty() {
         println!("  goals:    none open");

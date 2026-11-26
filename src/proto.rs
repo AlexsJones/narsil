@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::store::{AgentInfo, Goal, Objective};
+use crate::store::{AgentInfo, Goal};
 use crate::types::StoredMessage;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -35,6 +35,8 @@ pub enum Command {
     Approve { id: String, decision: String },
     SetMode { session: String, mode: String },
     SetModel { session: String, model: String },
+    /// Move a session to another directory.
+    SetDir { session: String, dir: String },
     /// Every configured provider with the models it offers right now.
     Models,
     /// Change the model that new sessions (`default`) or subagents (`subagent`)
@@ -86,8 +88,9 @@ pub enum Event {
     ApprovalDone { id: String },
     Notice { level: String, text: String },
     Goal { goal: Goal },
-    /// The session's objectives were set or changed status.
-    Objectives { items: Vec<Objective> },
+    /// The work items of a project changed. Sent to every client; each keeps
+    /// the ones for the project it is showing.
+    Work { project: String, items: Vec<crate::work::Item> },
     /// A subagent was created, started, or finished. `info` is its full current record.
     Agent { info: Box<AgentInfo> },
     SessionChanged,

@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, Paths};
+use crate::memory;
+use crate::obsidian::Vault;
 use crate::store::{Session, Store};
 use crate::util;
 
@@ -24,20 +26,37 @@ partial: inspect the current state before repeating it.
 - When the conversation grows long it is compacted into a summary and you continue from that. \
 Anything that must survive should be in memory, in task notes, or in files, not only in conversation.
 - Relative paths resolve against the working directory given below. Shell commands start there \
-each time; a `cd` does not persist between calls.
+each time; a `cd` does not persist between calls. When the task is about some other directory, move \
+the session there first with change_directory: project memory and the work plan are filed by \
+directory, so work done from the wrong one is filed where nobody will look for it.
 
 Memory:
 - Durable memory holds facts that matter beyond this task, in `global` scope (about the user, \
 everywhere) or `project` scope (about this working directory). Save with memory_save when you learn \
 a lasting preference, receive a correction, or discover something about a project that its files do \
 not already say. Relevant entries are shown below; memory_search finds the rest.
+- Memory is a graph of notes. An entry links to related entries with [[Title]]; link when you save, \
+and follow links with memory_read to reach what bears on the matter at hand. The user reads and \
+edits the same notes.
+- Write memory as you go, not at the end: a run that is cut short keeps what was already saved. \
+Above all record dead ends the moment you hit them (kind `dead_end`): what you were after, what you \
+tried, and why it failed, when the reason will still hold next time. If you search for something and \
+it is not there to be found, that is a finding; save it, so the search is not made twice.
+- Before starting on something, look at what memory already says about it. What is recalled for you \
+at the start of a request is there to be used: do not retry what is marked as tried and failed \
+unless something has changed, and tell the user what is already known instead of rediscovering it.
 - `task` scope is a shared notebook for this task: every agent working on it, including parallel \
 subagents, reads and writes the same notes.
 
 Working style:
 - Use tools to find things out instead of guessing. Check your work by running it.
-- For work with more than a couple of steps, lay out objectives with the objectives tool and keep \
-their status current. The user follows your progress there.
+- For work with more than a couple of steps, lay it out with work_plan as items that depend on each \
+other, then repeat: work_next to see what is ready and take an item, do it, check it, work_done with \
+the result and the evidence. The plan lives outside this conversation, so it survives compaction, \
+restarts and other sessions; after any of those, work_next tells you where things stand. The user \
+follows progress there and can change it.
+- When you come across something that needs doing but is not what you are on, file it (follow_ups \
+in work_done, or work_plan) instead of doing it at once or keeping it in your head.
 - Say what you did and what you found plainly, including failures.";
 
 const SUBAGENT_ROLE: &str = "\
@@ -51,11 +70,14 @@ user questions. Put intermediate findings that siblings could use in task notes 
 const GOAL_ROLE: &str = "\
 You are working autonomously on a goal. Nobody is watching and no reply will come, so do not ask \
 questions or wait for confirmation: decide, act, verify, and continue. Keep going until the objective \
-is achieved and you have verified it. Begin by breaking the goal into objectives with the objectives \
-tool, and keep their status current as you go. Record milestones with goal_update; those notes survive \
-compaction and restarts and are how you will know where you were. When the objective is complete and \
-verified, call goal_complete. If you are blocked on something only the user can provide, call \
-goal_blocked with the specific question, and stop.";
+is achieved and you have verified it. Begin by laying the goal out with work_plan, unless work_next \
+shows it is already laid out; then work through it item by item, closing each with its result and \
+evidence. Lay it out even when it looks quick: the items and their results are the record a later \
+session builds on when the user comes back to this. Hand several ready items to subagents when they are independent. What only the user can \
+settle becomes a question item, and you carry on with everything that does not depend on it. Record \
+milestones with goal_update. When every item is done and you have verified the whole, call \
+goal_complete; it is refused while items remain open. If nothing is left that can proceed without \
+the user, call goal_blocked with the open questions, and stop.";
 
 /// The memory scopes visible to a session: global, its project, its task.
 pub fn scopes_for(session: &Session) -> Vec<String> {
@@ -68,6 +90,11 @@ pub fn project_scope(cwd: &str) -> String {
 
 pub fn task_scope(session: &Session) -> String {
     format!("task:{}", session.root_id)
+}
+
+/// The directory a session's work items belong to: its project.
+pub fn project_dir(cwd: &str) -> String {
+    project_root(Path::new(cwd)).to_string_lossy().into_owned()
 }
 
 /// The enclosing git repository, or the directory itself.
@@ -177,7 +204,15 @@ pub fn build_system_prompt(cfg: &Config, paths: &Paths, store: &Store, session: 
     };
     s.push_str(&format!("- Permissions: {mode}.\n"));
 
+    if let Some(vault) = Vault::open(cfg) {
+        s.push_str("\n# Obsidian vault\n");
+        s.push_str(&vault.describe());
+        s.push('\n');
+    }
+
     // Durable memory: newest first, bodies until the budget is spent, then titles.
+    // Read from the notes first, so an edit made a moment ago in an editor counts.
+    memory::refresh(store, cfg, paths);
     let durable = vec!["global".to_string(), project_scope(&session.cwd)];
     let memories = store.memory_list(&durable, 200).unwrap_or_default();
     if !memories.is_empty() {
@@ -188,13 +223,13 @@ pub fn build_system_prompt(cfg: &Config, paths: &Paths, store: &Store, session: 
             let scope = if m.scope == "global" { "global" } else { "project" };
             if budget > 0 {
                 budget -= (m.title.len() + m.body.len()) as i64;
-                s.push_str(&format!("\n## {} [{} · {} · id {}]\n{}\n", m.title, scope, m.kind, m.id, m.body.trim()));
+                s.push_str(&format!("\n## {} [{} · {}]\n{}\n", m.title, scope, m.kind, m.body.trim()));
             } else {
-                titles_only.push(format!("- {} [{} · id {}]", m.title, scope, m.id));
+                titles_only.push(format!("- [[{}]] [{}]", m.title, scope));
             }
         }
         if !titles_only.is_empty() {
-            s.push_str("\nMore entries (use memory_search to read them):\n");
+            s.push_str("\nMore entries (read one with memory_read, or search with memory_search):\n");
             s.push_str(&titles_only.join("\n"));
             s.push('\n');
         }
@@ -208,11 +243,42 @@ pub fn build_system_prompt(cfg: &Config, paths: &Paths, store: &Store, session: 
         }
     }
 
-    let objectives = store.objectives_get(&session.id).unwrap_or_default();
-    if !objectives.is_empty() {
-        s.push_str("\n# Objectives (as you last set them)\n");
-        for o in &objectives {
-            s.push_str(&format!("- [{}] {}\n", o.status, o.text));
+    // Where this project's work stood when this context began. The agent asks
+    // work_next for the present state; this is so it knows there is something to ask about.
+    crate::work::refresh(store, cfg, paths);
+    if let Ok(view) = crate::work::Overview::of(store, &project_dir(&session.cwd)) {
+        let brief = view.brief();
+        if !brief.is_empty() {
+            s.push_str("\n# Work in this project\n");
+            s.push_str(&format!("When this context began: {brief}.\n"));
+            let running = |_: &str| true;
+            s.push_str(&util::truncate_middle(&view.text(&session.id, &running), 3000));
+            s.push_str("\nCall work_next for the present state before acting on this.\n");
+        }
+        if brief.is_empty() && !view.items.is_empty() {
+            let done: Vec<&str> = view.items.iter().filter(|i| i.parent.is_none() && i.status == "done").map(|i| i.title.as_str()).collect();
+            if !done.is_empty() {
+                s.push_str("\n# Work in this project\n");
+                s.push_str(&format!(
+                    "Finished earlier: {}. The items under each record what was done and how it was checked; \
+                     work_next with `show` reads any of them when you need to build on that work. When you change something that \
+                     work produced, file the change as an item under the same root (work_plan with that root) \
+                     and close it with its evidence, so the record of this project stays complete.\n",
+                    done.join("; ")
+                ));
+            }
+        }
+        if let Ok(elsewhere) = crate::work::finished_elsewhere(store, &project_dir(&session.cwd), 6) {
+            if !elsewhere.is_empty() {
+                s.push_str("\n# Done before, in other directories\n");
+                for (title, dir) in &elsewhere {
+                    s.push_str(&format!("- {title} (in {dir})\n"));
+                }
+                s.push_str(
+                    "If what you are asked now resembles one of these, read how it went before starting: \
+                     work_next with `show` set to its title and `project` to its directory.\n",
+                );
+            }
         }
     }
 
@@ -269,10 +335,11 @@ pub fn goal_brief(goal_id: &str, objective: &str) -> String {
     )
 }
 
-pub fn goal_continuation(iteration: i64) -> String {
+pub fn goal_continuation(iteration: i64, work: &str) -> String {
+    let stands = if work.is_empty() { String::new() } else { format!(" The work stands at: {work}.") };
     format!(
-        "[narsil] Continue working toward the goal (turn {iteration}). If the objective is fully achieved \
-         and verified, call goal_complete with a summary. If you are blocked on something only the user \
-         can resolve, call goal_blocked. Otherwise take the next concrete step now."
+        "[narsil] Continue working toward the goal (turn {iteration}).{stands} If the objective is fully \
+         achieved and verified, call goal_complete with a summary. If nothing can proceed without the \
+         user, call goal_blocked. Otherwise take the next ready item now."
     )
 }

@@ -6,16 +6,20 @@ mod context;
 mod daemon;
 mod engine;
 mod goals;
+mod memory;
+mod obsidian;
 mod proto;
 mod provider;
 mod service;
 mod setup;
 mod store;
+mod telemetry;
 mod tools;
 mod tui;
 mod types;
 mod util;
 mod voice;
+mod work;
 
 use std::io::{IsTerminal, Read, Write};
 
@@ -29,8 +33,16 @@ use crate::store::{Session, Store};
 use crate::types::{Block, MsgKind, Role};
 use crate::util::{first_line, fmt_age, fmt_tokens};
 
+/// The version this binary reports. A release is built by GoReleaser from a
+/// git tag, and the tag is the version; a plain `cargo build` falls back to
+/// the one in Cargo.toml.
+const VERSION: &str = match option_env!("NARSIL_VERSION") {
+    Some(tagged) => tagged,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "narsil", version, about = "A persistent agent harness: TUI, daemon, unified memory, autonomous goals")]
+#[command(name = "narsil", version = VERSION, about = "A persistent agent harness: TUI, daemon, unified memory, autonomous goals")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -90,12 +102,46 @@ enum Cmd {
     },
     /// Check configuration, backend connectivity, the daemon and sudo
     Doctor,
+    /// Show this directory's work: what is done, in progress, ready, blocked or waiting on you
+    Work {
+        /// An item's title, to print that item in full
+        item: Vec<String>,
+    },
+    /// Show the tree of what a session or goal did: each decision, the actions it led to, and the time they took
+    Trace {
+        /// A session or goal id (default: whatever ran most recently)
+        id: Option<String>,
+        /// A flat list in time order instead of the tree
+        #[arg(long)]
+        timeline: bool,
+        /// Write a flamegraph of where the time went to this SVG file
+        #[arg(long, value_name = "FILE")]
+        flamegraph: Option<String>,
+        /// Write a Chrome trace (open it at ui.perfetto.dev) to this file
+        #[arg(long, value_name = "FILE")]
+        chrome: Option<String>,
+        /// Print folded stacks, the input other flamegraph tools take
+        #[arg(long)]
+        folded: bool,
+        /// Print the recorded spans as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Totals over a period: time and tokens per model, time and failures per tool
+    Stats {
+        /// How far back to look, e.g. 30m, 24h, 7d
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
     /// Show the daemon log
     Logs {
         #[arg(short, long)]
         follow: bool,
         #[arg(short = 'n', long, default_value_t = 50)]
         lines: usize,
+        /// Only the lines of this session (with its subagents) or goal, by id
+        #[arg(short, long, value_name = "ID")]
+        session: Option<String>,
     },
     /// Run the daemon under systemd: restart after crashes, start at login
     Service {
@@ -125,6 +171,9 @@ struct SetupArgs {
     /// Skip the test request to the backend
     #[arg(long)]
     no_test: bool,
+    /// Obsidian vault to integrate with (a folder path), or `none` to turn it off
+    #[arg(long)]
+    obsidian: Option<String>,
 }
 
 #[derive(Args)]
@@ -208,7 +257,12 @@ enum MemoryCmd {
         kind: String,
     },
     Search { query: Vec<String> },
+    /// Forget an entry and remove its note (the id is the # shown by `list`)
     Rm { id: i64 },
+    /// Show where the memory notes are, and bring the index up to date with them
+    Sync,
+    /// Write every entry out again, for when the memory folder was lost
+    Restore,
 }
 
 #[derive(Subcommand)]
@@ -259,6 +313,16 @@ fn require_configured(paths: &Paths) -> Result<Config> {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     let paths = Paths::resolve();
+    // The daemon sets up its own logging once its database is open, since it also records spans.
+    let role = match &cli.cmd {
+        Some(Cmd::Daemon) => None,
+        None | Some(Cmd::Chat { .. }) | Some(Cmd::Resume { .. }) => Some(telemetry::Role::Tui),
+        _ => Some(telemetry::Role::Cli),
+    };
+    let _telemetry = role.map(|role| {
+        let _ = std::fs::create_dir_all(&paths.state_dir);
+        telemetry::init(role, &paths, &Config::load(&paths).unwrap_or_default())
+    });
     match cli.cmd {
         None => open_tui(&paths, cli.session, cli.cont, false).await,
         Some(Cmd::Chat { cont, session }) => open_tui(&paths, session.or(cli.session), cont || cli.cont, false).await,
@@ -277,6 +341,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     model: a.model,
                     yes: a.yes,
                     no_test: a.no_test,
+                    obsidian: a.obsidian,
                 },
             )
             .await
@@ -295,7 +360,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Some(Cmd::Memory { cmd }) => cmd_memory(&paths, cmd),
         Some(Cmd::Config { cmd }) => cmd_config(&paths, cmd.unwrap_or(ConfigCmd::Path)),
         Some(Cmd::Doctor) => cmd_doctor(&paths).await,
-        Some(Cmd::Logs { follow, lines }) => cmd_logs(&paths, follow, lines),
+        Some(Cmd::Trace { id, timeline, flamegraph, chrome, folded, json }) => {
+            cmd_trace(&paths, id, TraceOut { timeline, flamegraph, chrome, folded, json })
+        }
+        Some(Cmd::Stats { since }) => cmd_stats(&paths, &since),
+        Some(Cmd::Work { item }) => cmd_work(&paths, &item.join(" ")),
+        Some(Cmd::Logs { follow, lines, session }) => cmd_logs(&paths, follow, lines, session),
         Some(Cmd::Service { cmd }) => match cmd {
             ServiceCmd::Install => service::install(&paths),
             ServiceCmd::Uninstall => service::uninstall(),
@@ -630,7 +700,15 @@ async fn goal_action(paths: &Paths, id: &str, action: &str, status: &str) -> Res
 
 fn cmd_memory(paths: &Paths, cmd: MemoryCmd) -> Result<()> {
     let store = open_store(paths)?;
+    let cfg = Config::load(paths)?;
     let project = context::project_scope(&cwd()?);
+    // Say so when the notes cannot be reached, since what follows is then the index's copy.
+    let report = |r: &memory::Refresh| {
+        if !r.available {
+            eprintln!("note: {}", r.why);
+        }
+        r.problems.iter().for_each(|p| eprintln!("note: {p}"));
+    };
     let show = |m: &store::Memory| {
         let scope = if m.scope == "global" { "global".to_string() } else { m.scope.replacen(':', " ", 1) };
         println!("#{}  [{} · {}]  {}", m.id, scope, m.kind, m.title);
@@ -641,6 +719,7 @@ fn cmd_memory(paths: &Paths, cmd: MemoryCmd) -> Result<()> {
     match cmd {
         MemoryCmd::List { all } => {
             let scopes = if all { Vec::new() } else { vec!["global".to_string(), project] };
+            report(&memory::refresh(&store, &cfg, paths));
             let items = store.memory_list(&scopes, 500)?;
             if items.is_empty() {
                 println!("memory is empty");
@@ -654,10 +733,16 @@ fn cmd_memory(paths: &Paths, cmd: MemoryCmd) -> Result<()> {
             }
             let title = title.unwrap_or_else(|| first_line(&body, 60));
             let scope = if in_project { project } else { "global".to_string() };
-            let id = store.memory_save(&scope, &kind, &title, body.trim(), None)?;
-            println!("saved as #{id}; new sessions will see it");
+            let entry = memory::Entry { scope: &scope, kind: &kind, title: &title, body: body.trim(), source: None };
+            let saved = memory::save(&store, &cfg, paths, &entry)?;
+            println!(
+                "saved as #{}{}; new sessions will see it",
+                saved.id,
+                if saved.held { " (held: the memory folder is not reachable right now)" } else { "" }
+            );
         }
         MemoryCmd::Search { query } => {
+            report(&memory::refresh(&store, &cfg, paths));
             let items = store.memory_search(&query.join(" "), &[], 20)?;
             if items.is_empty() {
                 println!("no matches");
@@ -665,11 +750,24 @@ fn cmd_memory(paths: &Paths, cmd: MemoryCmd) -> Result<()> {
             items.iter().for_each(show);
         }
         MemoryCmd::Rm { id } => {
-            if store.memory_delete(id)? {
-                println!("deleted #{id}");
+            if memory::delete(&store, &cfg, paths, id)? {
+                println!("forgot #{id}");
             } else {
                 bail!("there is no memory #{id}");
             }
+        }
+        MemoryCmd::Sync => {
+            let root = memory::root(&cfg, paths);
+            println!("memory notes: {}{}", root.dir.display(), if root.vault.is_some() { " (in the Obsidian vault)" } else { "" });
+            let r = memory::refresh(&store, &cfg, paths);
+            println!("{}", r.summary());
+            r.problems.iter().for_each(|p| println!("  ! {p}"));
+            println!("{} entries indexed", store.memory_durable()?.len());
+        }
+        MemoryCmd::Restore => {
+            let r = memory::restore(&store, &cfg, paths)?;
+            println!("{}", r.summary());
+            r.problems.iter().for_each(|p| println!("  ! {p}"));
         }
     }
     Ok(())
@@ -786,6 +884,59 @@ async fn cmd_doctor(paths: &Paths) -> Result<()> {
         if nopasswd { "passwordless (usable unattended)" } else { "needs a password (fails fast inside narsil)" }
     );
     println!("permissions chats: {}, goals: {}", cfg.permissions.mode, cfg.permissions.goal_mode);
+    {
+        let root = memory::root(&cfg, paths);
+        let state = match open_store(paths) {
+            Ok(store) => {
+                // Looking only: a health check must not move the folder under a running daemon.
+                let n = store.memory_durable().map(|m| m.len()).unwrap_or(0);
+                match memory::folder_state(&root) {
+                    Some(true) => format!("{n} notes"),
+                    Some(false) => format!("{n} entries; the folder is set up when the daemon next starts or reloads"),
+                    None => format!("NOT REACHABLE, {n} entries served from the index"),
+                }
+            }
+            Err(e) => format!("{e:#}"),
+        };
+        println!("memory      {} ({state})", root.dir.display());
+        let recorded = open_store(paths).and_then(|s| s.spans_since(0)).map(|s| s.len()).unwrap_or(0);
+        println!(
+            "telemetry   log level {}, {} format; {recorded} spans recorded, kept {} days (`narsil trace`, `narsil stats`)",
+            std::env::var("NARSIL_LOG").unwrap_or_else(|_| cfg.telemetry.level.clone()),
+            cfg.telemetry.log_format,
+            cfg.telemetry.keep_days
+        );
+        for (what, path) in telemetry::locations(paths) {
+            println!("            {what}: {}", path.display());
+        }
+        let vault = cfg.obsidian.vault.trim();
+        println!(
+            "obsidian    {}",
+            match (vault.is_empty(), obsidian::Vault::open(&cfg)) {
+                (true, _) => "not set up (`narsil setup --obsidian <vault folder>`)".to_string(),
+                (false, Some(v)) => {
+                    let mut line =
+                        format!("{} ({} notes open to narsil), narsil's notes under {}/", v.root.display(), v.notes().len(), v.folder);
+                    if v.closed.by_user > 0 {
+                        line.push_str(&format!("\n            closed to narsil: {}", cfg.obsidian.exclude.join(", ")));
+                    }
+                    for p in &v.closed.problems {
+                        line.push_str(&format!("\n            ! exclude {p}"));
+                    }
+                    if let Some(inner) = v.vault_inside() {
+                        line.push_str(&format!(
+                            "\n            ! this folder is not a vault itself, but {} is. Set [obsidian] vault to that: as it \
+                             stands, narsil's notes are outside the vault Obsidian opens, and the folders beside it are \
+                             searched as if they were your notes.",
+                            inner.display()
+                        ));
+                    }
+                    line
+                }
+                (false, None) => format!("{vault} is NOT REACHABLE (is its drive mounted?)"),
+            }
+        );
+    }
     println!(
         "voice       {}",
         match voice::configured(&cfg.voice) {
@@ -796,10 +947,171 @@ async fn cmd_doctor(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_logs(paths: &Paths, follow: bool, lines: usize) -> Result<()> {
+fn cmd_work(paths: &Paths, item: &str) -> Result<()> {
+    let store = open_store(paths)?;
+    let cfg = Config::load(paths)?;
+    let project = context::project_dir(&cwd()?);
+    let state = work::refresh(&store, &cfg, paths);
+    if !state.available {
+        eprintln!("note: {}", state.why);
+    }
+    state.problems.iter().for_each(|p| eprintln!("note: {p}"));
+    let view = work::Overview::of(&store, &project)?;
+    if !item.trim().is_empty() {
+        let found = view.find(item).ok_or_else(|| anyhow!("there is no work item called {item:?} in {project}"))?;
+        println!("[{}] {}", found.status.replace('_', " "), view.bundle(found));
+        if !found.result.trim().is_empty() {
+            println!("Result:\n{}", found.result.trim());
+        }
+        if let Some(path) = &found.path {
+            println!("\nnote: {}", work::root(&cfg, paths).dir.join(path).display());
+        }
+        return Ok(());
+    }
+    if view.items.is_empty() {
+        println!("no work is laid out for {project}");
+        return Ok(());
+    }
+    fn show(view: &work::Overview, item: &work::Item, depth: usize) {
+        let blockers = view.open_blockers(item);
+        let mark = match item.status.as_str() {
+            "done" => "✓",
+            "dropped" => "✗",
+            "waiting" => "?",
+            "in_progress" => "▶",
+            _ if !view.children(&item.id).is_empty() => "▾",
+            _ if !blockers.is_empty() => "·",
+            _ => "○",
+        };
+        let mut extra = String::new();
+        if item.status == "in_progress" && !item.claimed_by.is_empty() {
+            extra = if item.claimed_agent.is_empty() { format!("  (session {})", item.claimed_by) } else { format!("  (subagent {})", item.claimed_agent) };
+        } else if !blockers.is_empty() && !item.closed() {
+            extra = format!("  (after {})", blockers.iter().map(|b| b.title.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        println!("{}{mark} {}{extra}", "  ".repeat(depth), item.title);
+        for part in view.children(&item.id) {
+            show(view, part, depth + 1);
+        }
+    }
+    for top in view.items.iter().filter(|i| i.parent.is_none()) {
+        show(&view, top, 0);
+    }
+    let brief = view.brief();
+    if !brief.is_empty() {
+        println!("\n{brief}");
+    }
+    println!("notes: {}", work::root(&cfg, paths).dir.display());
+    Ok(())
+}
+
+struct TraceOut {
+    timeline: bool,
+    flamegraph: Option<String>,
+    chrome: Option<String>,
+    folded: bool,
+    json: bool,
+}
+
+/// The session tree a trace is about: a goal's, a session's, or the latest one.
+fn trace_root(store: &Store, id: Option<&str>) -> Result<String> {
+    match id {
+        None => store.latest_span_root()?.ok_or_else(|| anyhow!("nothing has been recorded yet; the daemon records what it does as it runs")),
+        Some(id) => {
+            if let Ok(goal) = store.resolve_goal(id) {
+                let session = store.goal_get(&goal)?.and_then(|g| g.session_id).ok_or_else(|| anyhow!("goal {goal} has not started a session yet"))?;
+                return Ok(store.require_session(&session)?.root_id);
+            }
+            Ok(store.require_session(&store.resolve_session(id)?)?.root_id)
+        }
+    }
+}
+
+fn cmd_trace(paths: &Paths, id: Option<String>, out: TraceOut) -> Result<()> {
+    let store = open_store(paths)?;
+    let root = trace_root(&store, id.as_deref())?;
+    let spans = store.spans_for_root(&root)?;
+    if spans.is_empty() {
+        bail!("nothing is recorded for session {root} (it ran before recording existed, or its records were pruned)");
+    }
+    let now = telemetry::now_ms();
+    if out.json {
+        println!("{}", serde_json::to_string_pretty(&spans)?);
+        return Ok(());
+    }
+    if out.folded {
+        telemetry::folded(&spans, now).iter().for_each(|l| println!("{l}"));
+        return Ok(());
+    }
+    let mut wrote = false;
+    if let Some(file) = &out.flamegraph {
+        let title = store.get_session(&root)?.map(|s| first_line(&s.title, 80)).filter(|t| !t.is_empty()).unwrap_or_else(|| root.clone());
+        std::fs::write(file, telemetry::flamegraph(&spans, now, &format!("narsil: {title}"))?).with_context(|| format!("writing {file}"))?;
+        println!("flamegraph written to {file} (open it in a browser)");
+        wrote = true;
+    }
+    if let Some(file) = &out.chrome {
+        std::fs::write(file, telemetry::chrome_trace(&spans, now).to_string()).with_context(|| format!("writing {file}"))?;
+        println!("trace written to {file} (open it at ui.perfetto.dev or chrome://tracing)");
+        wrote = true;
+    }
+    if wrote {
+        return Ok(());
+    }
+    let width = if std::io::stdout().is_terminal() { crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120) } else { 140 };
+    let lines = if out.timeline { telemetry::timeline(&spans, now) } else { telemetry::tree(&spans, &telemetry::Notes::load(&store, &spans), now, width.clamp(60, 200)) };
+    lines.iter().for_each(|l| println!("{l}"));
+    println!();
+    telemetry::summary(&spans, now).iter().for_each(|l| println!("{l}"));
+    Ok(())
+}
+
+fn cmd_stats(paths: &Paths, since: &str) -> Result<()> {
+    let (digits, unit) = since.trim().split_at(since.trim().find(|c: char| !c.is_ascii_digit()).unwrap_or(since.trim().len()));
+    let n: i64 = digits.parse().map_err(|_| anyhow!("--since takes a number and a unit, such as 30m, 24h or 7d"))?;
+    let ms = n * match unit {
+        "m" | "min" => 60_000,
+        "h" | "" => 3_600_000,
+        "d" => 86_400_000,
+        other => bail!("unknown unit {other:?}; use m, h or d"),
+    };
+    let store = open_store(paths)?;
+    let now = telemetry::now_ms();
+    let spans = store.spans_since(now - ms)?;
+    println!("the last {since}:");
+    telemetry::stats(&spans, now).iter().for_each(|l| println!("{l}"));
+    Ok(())
+}
+
+fn cmd_logs(paths: &Paths, follow: bool, lines: usize, session: Option<String>) -> Result<()> {
     let file = paths.log_file();
     if !file.exists() {
         bail!("no log yet at {}", file.display());
+    }
+    if let Some(id) = session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // A session id may be given in short, as elsewhere; a goal id is taken as it is.
+        let id = open_store(paths).ok().and_then(|s| s.resolve_session(id).ok()).unwrap_or_else(|| id.to_string());
+        let mut seen: Option<usize> = None;
+        loop {
+            let text = std::fs::read_to_string(&file)?;
+            let mine = telemetry::lines_of(&text, &id);
+            // The last few to begin with; after that, whatever is new.
+            let from = match seen {
+                None => mine.len().saturating_sub(lines),
+                Some(n) => n.min(mine.len()),
+            };
+            for line in &mine[from..] {
+                println!("{line}");
+            }
+            seen = Some(mine.len());
+            if !follow {
+                if mine.is_empty() {
+                    eprintln!("no lines for {id} in {}", file.display());
+                }
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
     if follow {
         use std::os::unix::process::CommandExt;

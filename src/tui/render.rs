@@ -10,6 +10,41 @@ use crate::store::AgentInfo;
 use crate::tools::summarize_call;
 use crate::util::{first_line, fmt_duration, now};
 
+/// The colour and the mark of anything that touches the user's Obsidian vault.
+pub const VAULT: Color = Color::Indexed(141);
+pub const VAULT_MARK: &str = "◈";
+
+static VAULT_ROOT: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Tell the renderer where the vault is (empty: there is none), so that file
+/// tools and commands that reach into it are marked like the vault tools.
+pub fn set_vault(root: &str) {
+    *VAULT_ROOT.write().unwrap_or_else(|e| e.into_inner()) = root.trim_end_matches('/').to_string();
+}
+
+/// Whether a tool call reads or writes the user's Obsidian vault.
+fn touches_vault(name: &str, input: &Value, cwd: &str) -> bool {
+    if name.starts_with("vault_") {
+        return true;
+    }
+    let root = VAULT_ROOT.read().unwrap_or_else(|e| e.into_inner());
+    if root.is_empty() {
+        return false;
+    }
+    let text = |key: &str| input.get(key).and_then(Value::as_str);
+    let inside = |path: &str| {
+        let path = crate::util::expand_tilde(path);
+        let full = if path.is_absolute() { path } else { std::path::Path::new(cwd).join(path) };
+        // `../Vault/x` from a folder beside the vault is in the vault.
+        crate::obsidian::lexical(&full).starts_with(root.as_str())
+    };
+    match name {
+        "bash" => text("command").is_some_and(|c| c.contains(root.as_str())) || inside(text("cwd").unwrap_or(".")),
+        "read_file" | "write_file" | "edit_file" | "list_dir" | "glob" | "grep" => inside(text("path").unwrap_or(".")),
+        _ => false,
+    }
+}
+
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub enum Item {
@@ -316,6 +351,8 @@ fn render(item: &Item, width: usize, expanded: bool, spin: usize, cwd: &str) -> 
             let body = if expanded { text.clone() } else { first_line(text, width.saturating_sub(6).max(20)) };
             prefixed(&body, width, "∴ ", "  ", dim().add_modifier(Modifier::ITALIC))
         }
+        // What narsil found in the vault for a request is shown as the vault's.
+        Item::Note { text } if text.starts_with("Obsidian:") => prefixed(text, width, "◈ ", "  ", Style::new().fg(VAULT)),
         Item::Note { text } => prefixed(text, width, "· ", "  ", dim()),
         Item::Error { text } => prefixed(text, width, "✗ ", "  ", Style::new().fg(Color::Red)),
         Item::Divider { text } => {
@@ -336,14 +373,18 @@ fn render(item: &Item, width: usize, expanded: bool, spin: usize, cwd: &str) -> 
             let mut lines = if roster {
                 agent_block(agents, *running, *is_error, output.is_some(), width, spin)
             } else {
-                let used = 2 + name.chars().count() + 1;
+                // Anything that reaches into the user's Obsidian vault is marked as such.
+                let vault = touches_vault(name, input, cwd);
+                let used = 2 + name.chars().count() + 1 + if vault { 2 } else { 0 };
                 let summary = first_line(&relative(&summarize_call(name, input)), width.saturating_sub(used).max(10));
-                vec![Line::from(vec![
-                    Span::styled(format!("{mark} "), mark_style),
-                    Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    Span::raw(summary),
-                ])]
+                let mut spans = vec![Span::styled(format!("{mark} "), mark_style)];
+                let mut named = Style::new().add_modifier(Modifier::BOLD);
+                if vault {
+                    spans.push(Span::styled(format!("{VAULT_MARK} "), Style::new().fg(VAULT)));
+                    named = named.fg(VAULT);
+                }
+                spans.extend([Span::styled(name.clone(), named), Span::raw(" "), Span::raw(summary)]);
+                vec![Line::from(spans)]
             };
             // The agent rows already say how each one ended; the full reports are one keypress away.
             let show_output = output.is_some() && (!roster || expanded);
@@ -480,9 +521,51 @@ fn agent_block(agents: &[AgentInfo], running: bool, is_error: bool, finished: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn text_of(lines: &[Line<'static>]) -> Vec<String> {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+    }
+
+    #[test]
+    fn what_touches_the_obsidian_vault_is_marked() {
+        let tool = |name: &str, input: Value| {
+            let mut e = Entry::new(Item::Tool {
+                id: "t".into(),
+                name: name.into(),
+                input,
+                output: Some("ok".into()),
+                is_error: false,
+                running: false,
+                agents: Vec::new(),
+            });
+            let lines = e.lines(80, false, 0, "/home/me/proj");
+            (text_of(lines)[0].clone(), lines[0].spans.iter().any(|s| s.style.fg == Some(VAULT)))
+        };
+        // The vault tools are the vault's wherever it is.
+        let (line, purple) = tool("vault_search", json!({ "query": "heat pump" }));
+        assert_eq!(line, "● ◈ vault_search heat pump");
+        assert!(purple);
+        let (line, purple) = tool("read_file", json!({ "path": "/home/me/Vault/Me.md" }));
+        assert_eq!(line, "● read_file /home/me/Vault/Me.md");
+        assert!(!purple, "with no vault known, a file is just a file");
+
+        set_vault("/home/me/Vault/");
+        let (line, purple) = tool("read_file", json!({ "path": "/home/me/Vault/Me.md" }));
+        assert_eq!(line, "● ◈ read_file /home/me/Vault/Me.md");
+        assert!(purple);
+        assert!(tool("grep", json!({ "pattern": "x", "path": "../Vault/People" })).0.starts_with("● ◈ grep"), "a relative path is taken from the working directory");
+        assert!(tool("bash", json!({ "command": "ls /home/me/Vault" })).1);
+        assert!(!tool("read_file", json!({ "path": "/home/me/Vault2/Me.md" })).1, "a folder that only starts the same is not the vault");
+        assert!(!tool("read_file", json!({ "path": "src/main.rs" })).1);
+        assert!(!tool("memory_save", json!({ "title": "t", "body": "b" })).1, "narsil's own memory is not the user's notes");
+        set_vault("");
+
+        let mut note = Entry::new(Item::Note { text: "Obsidian: notes of the user's that may bear on this: Me.md".into() });
+        let lines = note.lines(80, false, 0, "");
+        assert!(text_of(lines)[0].starts_with("◈ Obsidian:") && lines[0].style.fg == Some(VAULT));
+        let mut plain = Entry::new(Item::Note { text: "Recalled from memory: x".into() });
+        assert!(text_of(plain.lines(80, false, 0, ""))[0].starts_with("· "));
     }
 
     #[test]

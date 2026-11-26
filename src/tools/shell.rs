@@ -47,6 +47,9 @@ pub async fn bash(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         Some(d) => resolve(&ctx.session.cwd, d),
         None => std::path::PathBuf::from(&ctx.session.cwd),
     };
+    if let Some(why) = crate::obsidian::Vault::open(cfg).and_then(|v| v.refuses_shell(command, &cwd)) {
+        return Ok(ToolOutput::err(why));
+    }
     // Journal the process group, tagged so it can be recognized later: if the
     // harness dies mid-command, recovery stops the orphan instead of leaving
     // it running behind the agent's back.
@@ -113,9 +116,17 @@ pub async fn run_command(
         return Ok(ToolOutput::err(format!("working directory does not exist: {}", cwd.display())));
     }
     let mut cmd = tokio::process::Command::new(&shell.program);
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
+    // The command travels in the environment and is evaluated from there, so
+    // it is not on the shell's own command line. Otherwise `pkill -f pattern`
+    // or `pgrep -f pattern` inside the command matches the shell running it,
+    // and the command kills itself.
+    let name = Path::new(&shell.program).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if matches!(name.as_str(), "bash" | "sh" | "zsh" | "dash" | "ksh") {
+        cmd.arg("-c").arg("c=$NARSIL_COMMAND; unset NARSIL_COMMAND; eval \"$c\"").env("NARSIL_COMMAND", command);
+    } else {
+        cmd.arg("-c").arg(command);
+    }
+    cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -239,6 +250,22 @@ mod tests {
         let bad = run_command(&shell(), "echo nope; exit 3", &cwd, Duration::from_secs(10), &cancel, "", &|_| {}).await.unwrap();
         assert!(bad.is_error);
         assert_eq!(bad.content, "nope\n[exit code 3]");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_matches_processes_by_pattern_does_not_match_itself() {
+        let cwd = std::env::temp_dir();
+        let cancel = CancellationToken::new();
+        // With the command on the shell's own command line, `pgrep -f` finds that
+        // shell, and the `pkill -f` an agent would write next kills its own command.
+        let probe = "pgrep -f narsil-selfmatch-probe-91 >/dev/null && echo matched-itself || echo clean; echo \"$0 ${NARSIL_COMMAND:-unset}\"";
+        let out = run_command(&shell(), probe, &cwd, Duration::from_secs(10), &cancel, "", &|_| {}).await.unwrap();
+        assert!(out.content.starts_with("clean\n"), "{}", out.content);
+        assert!(out.content.contains(" unset"), "the command itself does not see how it was handed over: {}", out.content);
+        // Quoting, variables and multiple lines pass through untouched.
+        let tricky = "x='a \"b\" $c'; printf '%s|' \"$x\" \"$(echo two words)\"\necho; echo done";
+        let out = run_command(&shell(), tricky, &cwd, Duration::from_secs(10), &cancel, "", &|_| {}).await.unwrap();
+        assert_eq!(out.content, "a \"b\" $c|two words|\ndone");
     }
 
     #[tokio::test]

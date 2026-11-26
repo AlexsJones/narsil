@@ -117,6 +117,9 @@ impl Client {
             .await
             .map_err(network_error)?;
         let status = resp.status().as_u16();
+        let request_id = resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        tracing::Span::current().record("request_id", request_id.as_str());
+        tracing::debug!(status, request_id, model = req.model, "request sent to the chat completions API");
         if !(200..300).contains(&status) {
             let wait = retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();

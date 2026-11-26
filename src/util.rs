@@ -3,11 +3,13 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Timestamped line on stderr. The daemon's stderr is the log file.
+/// An info-level line in the log. Kept as a macro of its own for the plain
+/// "this happened" lines; use `tracing::warn!`, `error!` and `debug!` directly
+/// for anything else, and fields (`key = value`) for values worth filtering on.
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {{
-        eprintln!("{} {}", $crate::util::timestamp(), format!($($arg)*));
+        tracing::info!($($arg)*);
     }};
 }
 

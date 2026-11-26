@@ -3,6 +3,10 @@ name = "narsil"
 version = "0.1.0"
 edition = "2024"
 description = "A persistent, provider-agnostic agent harness: daemon, TUI, unified memory, autonomous goals"
+license = "MIT"
+repository = "https://github.com/AlexsJones/narsil"
+homepage = "https://github.com/AlexsJones/narsil"
+readme = "README.md"
 
 [[bin]]
 name = "narsil"
@@ -17,6 +21,7 @@ dialoguer = "0.12"
 futures-util = "0.3"
 globset = "0.4"
 ignore = "0.4"
+inferno = { version = "0.12.8", default-features = false }
 libc = "0.2"
 ratatui = "0.30"
 regex = "1"
@@ -28,9 +33,21 @@ textwrap = "0.16"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "registry", "std", "ansi"] }
 unicode-width = "0.2"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 strip = true
+
+# Optimised, but with the symbols a CPU profiler needs:
+#   cargo build --profile profiling && perf record -g target/profiling/narsil ...
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+[dev-dependencies]
+# The tests under tests/ drive the built binary and read what it left behind.
