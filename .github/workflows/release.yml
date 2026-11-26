@@ -1,0 +1,45 @@
+name: release
+
+# A tag is a release: `git tag v0.2.0 && git push origin v0.2.0`.
+# Run by hand from the Actions tab (or `gh workflow run release.yml`) it is a
+# rehearsal: everything is built and packaged, nothing is published.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    # A Mac, so that the macOS binaries are built natively. The Linux ones are
+    # cross-compiled from here with zig.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # GoReleaser reads the history for the changelog and the tag for the version.
+          fetch-depth: 0
+      - name: Rust
+        run: rustup update stable && rustup default stable
+      - name: zig and cargo-zigbuild
+        run: brew install cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: ${{ github.ref_type == 'tag' && 'release --clean' || 'release --snapshot --clean' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      - name: Keep what a rehearsal built
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rehearsal
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+            dist/homebrew/Casks/*.rb
+          retention-days: 7

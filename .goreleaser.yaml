@@ -1,0 +1,111 @@
+# How narsil is released. The git tag is the version:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# and .github/workflows/release.yml runs GoReleaser, which builds the four
+# binaries, names and checksums the archives, writes the changelog, creates
+# the GitHub release, and updates the Homebrew tap (AlexsJones/homebrew-narsil).
+#
+# To try all of it without publishing anything:
+#
+#   goreleaser release --snapshot --clean
+#
+# That needs zig and cargo-zigbuild for the Linux builds (`brew install
+# cargo-zigbuild`), and a Mac for the macOS ones.
+version: 2
+
+project_name: narsil
+
+builds:
+  # macOS, built natively: the release job runs on a Mac.
+  - id: macos
+    builder: rust
+    binary: narsil
+    command: build
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+    flags:
+      - --release
+      - --locked
+    env:
+      # What `narsil --version` reports: the tag, not what Cargo.toml happens to say.
+      - NARSIL_VERSION={{ .Version }}
+
+  # Linux, cross-compiled with zig (the builder's default command is `zigbuild`).
+  - id: linux
+    builder: rust
+    binary: narsil
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+    env:
+      - NARSIL_VERSION={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - docs/*.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev+{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: AlexsJones
+    name: narsil
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```sh
+    brew install AlexsJones/narsil/narsil
+    ```
+
+    macOS (Apple silicon and Intel) and Linux (x86_64 and arm64). Then `narsil setup`.
+
+homebrew_casks:
+  - name: narsil
+    binaries:
+      - narsil
+    homepage: "https://github.com/AlexsJones/narsil"
+    description: "A persistent agent harness: a daemon that runs the agents and a terminal UI that attaches to it"
+    commit_msg_template: "narsil {{ .Tag }}"
+    hooks:
+      post:
+        # The binaries are not signed with an Apple developer certificate, so
+        # macOS would refuse to run what Homebrew downloaded. This is the step
+        # GoReleaser documents for that case.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/narsil"]
+          end
+    repository:
+      owner: AlexsJones
+      name: homebrew-narsil
+      branch: main
+      # Pushed with a deploy key that can write to the tap and to nothing else.
+      # Its private half is the HOMEBREW_TAP_DEPLOY_KEY secret of this repository.
+      git:
+        url: "git@github.com:AlexsJones/homebrew-narsil.git"
+        private_key: '{{ envOrDefault "HOMEBREW_TAP_DEPLOY_KEY" "" }}'
+    commit_author:
+      name: narsil-release
+      email: 41898282+github-actions[bot]@users.noreply.github.com

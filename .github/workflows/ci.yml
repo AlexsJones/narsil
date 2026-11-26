@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # narsil is developed on Linux. The macOS run is here to be seen, and does
+    # not yet decide whether a change is good.
+    continue-on-error: ${{ matrix.informational }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            informational: false
+          - os: macos-latest
+            informational: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust
+        run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      # Unit tests, and the scenarios in tests/, each of which starts its own
+      # daemon with the scripted model. The tests in tests/live.rs call a real
+      # model and are never run here.
+      - name: Test
+        run: cargo test --locked
+
+  release-config:
+    name: release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check
