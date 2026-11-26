@@ -39,6 +39,8 @@ pub const COMMANDS: &[Cmd] = &[
     cmd("/resume", "<session id>", "open a session by id"),
     cmd("/remember", "<text>", "save a global memory"),
     cmd("/reload", "", "re-read config.toml"),
+    cmd("/files", "", "show or hide the file explorer"),
+    cmd("/daemonrestart", "", "stop and start the daemon, and reconnect"),
     cmd("/forget", "<id>", "delete a memory"),
     cmd("/voice", "", "start or stop voice input"),
     cmd("/logs", "[errors]", "the log, filtered, in a window"),

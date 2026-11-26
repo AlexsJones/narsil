@@ -15,10 +15,19 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8192)].contains(&0)
 }
 
+/// Put on record which file a call is about, as it resolves now. The session
+/// may move to another directory later, and a relative path would then point
+/// somewhere else; the explorer shows where narsil has actually been.
+fn on_record(ctx: &ToolCtx<'_>, path: &Path) {
+    let state = serde_json::json!({ "path": crate::obsidian::lexical(path) });
+    let _ = ctx.engine.store.tool_call_set_state(&ctx.session.id, ctx.call, &state);
+}
+
 pub async fn read_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let path = resolve(&ctx.session.cwd, str_arg(input, "path")?);
     guard(ctx.cfg, &path)?;
+    on_record(ctx, &path);
     let meta = std::fs::metadata(&path).with_context(|| format!("{}", path.display()))?;
     if meta.is_dir() {
         return Ok(ToolOutput::err(format!("{} is a directory; use list_dir", path.display())));
@@ -71,6 +80,7 @@ pub async fn write_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let path = resolve(&ctx.session.cwd, str_arg(input, "path")?);
     guard(ctx.cfg, &path)?;
+    on_record(ctx, &path);
     let content = str_arg(input, "content")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -90,6 +100,7 @@ pub async fn edit_file(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let input = &ctx.call.input;
     let path = resolve(&ctx.session.cwd, str_arg(input, "path")?);
     guard(ctx.cfg, &path)?;
+    on_record(ctx, &path);
     let old = str_arg(input, "old_string")?;
     let new = str_arg(input, "new_string")?;
     if old.is_empty() {

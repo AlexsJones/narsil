@@ -310,6 +310,13 @@ impl Narsil {
         Some((path, text))
     }
 
+    /// Run the daemon in the foreground as a child of the test, as a program that stays
+    /// open after starting it would have it.
+    pub fn spawn_daemon(&self) -> std::process::Child {
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(self.base.join("daemon.out")).unwrap();
+        self.command(&self.base, &["daemon"]).stdout(log.try_clone().unwrap()).stderr(log).spawn().expect("starting the daemon")
+    }
+
     pub fn stop(&self) {
         let _ = self.try_run(&self.base, &["stop"]);
     }

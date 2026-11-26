@@ -2,6 +2,7 @@
 //! reopening it shows the session exactly as the daemon has it.
 
 mod complete;
+mod files;
 mod input;
 mod keys;
 mod models;
@@ -54,9 +55,11 @@ Keys (f1 or /keys lists all of them as they are bound now; [keys] in config.toml
   pgup / pgdn      scroll                  up / down            input history
   ctrl+o           expand tool output      alt+t                show or hide thinking
   f2               voice input             ctrl+d               quit (work continues)
-  tab              complete a command being typed; otherwise focus the side panel: up/down
-                   jumps the conversation to where each work item, subagent or milestone
-                   was last touched; enter opens a subagent; esc returns to the live end
+  tab              complete a command being typed; otherwise pop the goal and work panel in and
+                   out. In it, up/down jumps the conversation to where each work item, subagent
+                   or milestone was last touched; enter opens a subagent; esc returns to the end
+  shift+tab        pop the file explorer in and out. In it, up/down moves, enter opens a folder,
+                   or a file as a window on what narsil has done to it; esc leaves it shown
 
 Tabs (each tab is a session of its own; they all keep working at once)
   ctrl+t           new tab                 alt+w                close this tab
@@ -70,6 +73,9 @@ Sessions
   /resume <id>     open a session by id    /title <text>        rename this session
   /logs [errors]   the daemon log in a window: this session's lines, following as they are written.
                    e errors, w warnings, i info, a all; s this session or all; / find text
+  /daemonrestart   stop and start the daemon (after an update, say) and reconnect every tab
+  /files           the file explorer on the left (shift+tab): the folder this session works in, with what
+                   narsil made (+), changed (~), read (○) and is on now (▶); elsewhere, in grey
   /cleargoal       clear the side panel: drop what is unfinished in this directory's plan (and
                    cancel this session's goal); what was done stays on record
   /cd <directory>  move this session to another directory (tab completes folder names): its commands, project memory and
@@ -245,6 +251,19 @@ struct App {
     completing: Option<(String, usize)>,
     /// An open /trace or /stats: which, when it was last read, and whether it follows the latest steps.
     live_view: Option<(&'static str, Instant, bool)>,
+    /// The file explorer on the left: shown, and whether the keyboard is in it.
+    files_visible: bool,
+    files_focus: bool,
+    files_sel: usize,
+    /// Folders opened and shut by hand.
+    files_folds: files::Folds,
+    files_rows: Vec<files::Row>,
+    /// When the journal was last read for it, and when the disk was last looked over.
+    files_read: Option<Instant>,
+    files_scanned: Option<Instant>,
+    files_on_disk: std::collections::HashSet<std::path::PathBuf>,
+    /// The directory the explorer last showed, to notice a move at once.
+    files_root: String,
     /// Work the user cleared from the panel with /cleargoal: top-level items no longer shown here.
     work_cleared: std::collections::HashSet<String>,
     /// The /logs window's filters, while it is open.
@@ -256,6 +275,12 @@ struct App {
     keys: Arc<KeyMap>,
     /// Set by /keys: the window opens the list of keys.
     want_keys: bool,
+    /// Set by /daemonrestart: the window restarts the daemon and reconnects every tab.
+    want_restart: bool,
+    /// The number of this tab's connection to the daemon.
+    conn_id: u64,
+    /// The file whose history is open in a window, and where in the conversation it was last touched.
+    file_view: Option<Option<i64>>,
     /// Its run ended while another tab was in front.
     unseen: bool,
 }
@@ -270,6 +295,9 @@ struct Tabs {
     tabs: Vec<(u64, App)>,
     active: usize,
     next_id: u64,
+    /// Each connection to the daemon has a number of its own: a tab that is given a new
+    /// connection (the daemon was restarted) no longer answers to the old one's.
+    next_conn: u64,
     keys: Arc<KeyMap>,
     /// The keys window, with how far it is scrolled, when it is open.
     keys_window: Option<usize>,
@@ -285,21 +313,72 @@ struct Tabs {
 }
 
 impl Tabs {
-    /// Open a tab on a fresh connection, in `cwd`. Returns its index.
-    async fn open(&mut self, cwd: String) -> Result<usize> {
+    /// A new connection to the daemon, with its events sent on under its number.
+    async fn link(&mut self) -> Result<(Conn, u64)> {
         let mut conn = Conn::connect_or_start(&self.paths).await?;
         let mut pushes = conn.take_events();
-        let id = self.next_id;
-        self.next_id += 1;
+        let number = self.next_conn;
+        self.next_conn += 1;
         let all = self.push_tx.clone();
         tokio::spawn(async move {
             while let Some(env) = pushes.recv().await {
-                if all.send((id, Some(env))).is_err() {
+                if all.send((number, Some(env))).is_err() {
                     return;
                 }
             }
-            let _ = all.send((id, None));
+            let _ = all.send((number, None));
         });
+        Ok((conn, number))
+    }
+
+    /// Stop the daemon and start it again, with the narsil program as it is on disk now, and
+    /// give every tab a new connection to it with its session taken up again.
+    async fn restart_daemon(&mut self) {
+        let program = crate::service::program();
+        let ran = tokio::task::spawn_blocking(move || std::process::Command::new(&program).arg("restart").stdin(std::process::Stdio::null()).output()).await;
+        let trouble = match ran {
+            Ok(Ok(out)) if out.status.success() => None,
+            Ok(Ok(out)) => Some(first_line(String::from_utf8_lossy(&out.stderr).trim(), 200)),
+            Ok(Err(e)) => Some(format!("could not run narsil restart: {e}")),
+            Err(e) => Some(format!("{e}")),
+        };
+        // Whatever happened, the old connections are gone: connect afresh (which starts a daemon if none is up).
+        for i in 0..self.tabs.len() {
+            match self.link().await {
+                Ok((conn, number)) => {
+                    let app = &mut self.tabs[i].1;
+                    app.conn = Arc::new(conn);
+                    app.conn_id = number;
+                    app.approvals.clear();
+                    if let Some(sid) = app.sid() {
+                        if let Err(e) = app.attach(&sid).await {
+                            app.error(format!("could not reopen session {sid}: {e:#}"));
+                        }
+                    }
+                }
+                Err(e) => self.tabs[i].1.error(format!("could not reconnect to the daemon: {e:#}")),
+            }
+        }
+        let status = self.app().conn.call(Command::Status).await.ok();
+        let version = status.as_ref().and_then(|s| s["version"].as_str()).unwrap_or("?").to_string();
+        // On Linux a program replaced while it runs no longer has a file: this window is the old one.
+        let stale = std::env::current_exe().is_ok_and(|exe| !exe.exists());
+        let app = self.app();
+        match trouble {
+            Some(why) => app.error(format!("restarting the daemon: {why}")),
+            None => app.note(format!(
+                "the daemon was restarted (narsil {version}). Work that was in flight was suspended: goals pick up by themselves, a chat with /continue.{}",
+                if stale { " This window is still the older program: quit and open narsil again to finish the update." } else { "" }
+            )),
+        }
+        self.dirty = true;
+    }
+
+    /// Open a tab on a fresh connection, in `cwd`. Returns its index.
+    async fn open(&mut self, cwd: String) -> Result<usize> {
+        let (conn, conn_id) = self.link().await?;
+        let id = self.next_id;
+        self.next_id += 1;
         let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<Bg>();
         let all = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -309,7 +388,8 @@ impl Tabs {
                 }
             }
         });
-        let app = App::new(self.paths.clone(), self.cfg.clone(), self.store.clone(), cwd, conn, bg_tx, self.keys.clone());
+        let mut app = App::new(self.paths.clone(), self.cfg.clone(), self.store.clone(), cwd, conn, bg_tx, self.keys.clone());
+        app.conn_id = conn_id;
         self.tabs.push((id, app));
         self.dirty = true;
         Ok(self.tabs.len() - 1)
@@ -432,6 +512,9 @@ impl Tabs {
             self.keys_window = Some(0);
             self.dirty = true;
         }
+        if std::mem::take(&mut self.app().want_restart) {
+            self.restart_daemon().await;
+        }
     }
 
     async fn run_loop(
@@ -467,18 +550,19 @@ impl Tabs {
                 Some((id, env)) = pushes.recv() => {
                     let mut next = Some((id, env));
                     while let Some((id, env)) = next {
+                        // `id` is a connection's number: the tab that holds that connection now.
                         let front = self.tabs[self.active].0;
-                        match (self.tabs.iter_mut().find(|(tab, _)| *tab == id), env) {
-                            (Some((_, app)), Some(env)) => {
+                        match (self.tabs.iter_mut().find(|(_, app)| app.conn_id == id), env) {
+                            (Some((tab, app)), Some(env)) => {
                                 let was = app.run_state.clone();
                                 app.on_push(env);
                                 // A run that ends behind another tab leaves a mark on its tab.
-                                if id != front && was == "running" && app.run_state != "running" {
+                                if *tab != front && was == "running" && app.run_state != "running" {
                                     app.unseen = true;
                                 }
                             }
                             (Some(_), None) => bail!("lost the connection to the narsil daemon (sessions are safe; reopen with `narsil -c`)"),
-                            // A tab that has been closed.
+                            // A tab that has been closed, or a connection a tab has since replaced.
                             (None, _) => {}
                         }
                         // What happens in any tab can change the tab bar.
@@ -604,6 +688,7 @@ pub async fn run(paths: Paths, cfg: Config, opts: Opts) -> Result<()> {
         tabs: Vec::new(),
         active: 0,
         next_id: 1,
+        next_conn: 1,
         keys: keys.clone(),
         keys_window: None,
         going: None,
@@ -710,12 +795,24 @@ impl App {
             pending_model: None,
             completing: None,
             live_view: None,
+            files_visible: false,
+            files_focus: false,
+            files_sel: 0,
+            files_folds: Default::default(),
+            files_rows: Vec::new(),
+            files_read: None,
+            files_scanned: None,
+            files_on_disk: Default::default(),
+            files_root: String::new(),
             work_cleared: Default::default(),
             logs: None,
             vault: None,
             bg_tx,
             keys,
             want_keys: false,
+            want_restart: false,
+            conn_id: 0,
+            file_view: None,
             unseen: false,
         };
         app.check_vault();
@@ -747,6 +844,7 @@ impl App {
             self.spin += 1;
             self.dirty = true;
         }
+        self.refresh_files(false);
         if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5)) {
             self.flash = None;
             self.dirty = true;
@@ -1086,6 +1184,7 @@ impl App {
                     }
                     e.touch();
                 }
+                self.files_read = None;
             }
             Event::RunState { state } => {
                 if state != "running" {
@@ -1277,15 +1376,17 @@ impl App {
         self.dirty = true;
     }
 
-    /// Move the keyboard to the side panel, or say why there is nothing to move to.
-    fn to_panel(&mut self) {
-        if self.panel_visible {
-            self.focus_panel();
-        } else if self.panel_hidden {
-            self.flash("the side panel is hidden; /panel shows it");
-        } else {
-            self.flash("nothing in the side panel yet: it fills in with goals, work items and subagents");
+    /// The goal and work panel's key: pop it in and go to it, then pop it out again.
+    fn toggle_panel(&mut self) {
+        if self.nav().iter().all(|n| n.anchor.is_none()) {
+            self.flash("nothing in the goal and work panel yet: it fills in with goals, work items and subagents");
+            return;
         }
+        // Out, or in but not held: bring it in and take the keyboard to it.
+        self.panel_hidden = false;
+        self.files_focus = false;
+        self.focus_panel();
+        self.dirty = true;
     }
 
     /// The suggestion to show after the cursor, when it sits at the end of a command being typed.
@@ -1298,6 +1399,257 @@ impl App {
             return complete::cd_ghost(typed, std::path::Path::new(&self.here()));
         }
         complete::ghost(&self.input.text)
+    }
+
+    /// Read again what the explorer shows: the directory, what the file tools did
+    /// there, and what changed on disk. Often while the session works, now and
+    /// then while it rests; at once when `now` is set.
+    fn refresh_files(&mut self, now: bool) {
+        if !self.files_visible {
+            return;
+        }
+        // A move to another directory (/cd, another session) shows at once, and starts the folds afresh.
+        let here = self.here();
+        let moved = here != self.files_root;
+        if moved {
+            self.files_root = here;
+            self.files_folds = Default::default();
+            self.files_sel = 0;
+        }
+        let now = now || moved;
+        let working = self.run_state == "running";
+        let every = Duration::from_millis(if working { 700 } else { 4000 });
+        if !now && self.files_read.is_some_and(|at| at.elapsed() < every) {
+            return;
+        }
+        let root = std::path::PathBuf::from(self.here());
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let (touched, since) = match &self.session {
+            Some(session) => {
+                let calls: Vec<files::Call> = self
+                    .store
+                    .file_calls(&session.root_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, input, status, is_error, result, message_id, session, cwd, resolved)| files::Call { name, input, status, is_error, result, message_id, session, cwd, resolved })
+                    .collect();
+                (files::touches(&calls, &session.id), Some(std::time::UNIX_EPOCH + Duration::from_secs(session.created_at.max(0) as u64)))
+            }
+            None => (Default::default(), None),
+        };
+        // Looking over the disk for what commands changed costs more, so it is done less often.
+        let scan_every = Duration::from_secs(if working { 3 } else { 10 });
+        if now || self.files_scanned.is_none_or(|at| at.elapsed() >= scan_every) {
+            self.files_on_disk = since.map(|since| files::changed_on_disk(&root, since)).unwrap_or_default();
+            self.files_scanned = Some(Instant::now());
+        }
+        let rows = files::rows(&root, &touched, &self.files_on_disk, &self.files_folds);
+        if rows != self.files_rows {
+            self.files_rows = rows;
+            self.dirty = true;
+        }
+        self.files_sel = self.files_sel.min(self.files_rows.len().saturating_sub(1));
+        self.files_read = Some(Instant::now());
+    }
+
+    /// The explorer's key: show it and go to it, then hide it.
+    fn toggle_files(&mut self) {
+        match (self.files_visible, self.files_focus) {
+            (false, _) => {
+                self.files_visible = true;
+                self.files_focus = true;
+                self.panel_focus = false;
+                self.refresh_files(true);
+                // Start where the work is: the file being worked on, else the last one touched here.
+                let on = |m: files::Mark| self.files_rows.iter().position(|r| !r.dir && !r.elsewhere && r.mark == m);
+                self.files_sel = on(files::Mark::Now)
+                    .or_else(|| self.files_rows.iter().enumerate().filter(|(_, r)| !r.elsewhere && r.anchor.is_some()).max_by_key(|(_, r)| r.anchor).map(|(i, _)| i))
+                    .unwrap_or(0);
+            }
+            (true, false) => {
+                self.files_focus = true;
+                self.panel_focus = false;
+            }
+            (true, true) => {
+                self.files_visible = false;
+                self.files_focus = false;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Keys while the explorer has the keyboard. Returns false for keys it does not use.
+    fn files_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) || self.files_rows.is_empty() {
+            return false;
+        }
+        let last = self.files_rows.len() - 1;
+        let row = self.files_rows[self.files_sel.min(last)].clone();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.files_sel = self.files_sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.files_sel = (self.files_sel + 1).min(last),
+            KeyCode::Home | KeyCode::Char('g') => self.files_sel = 0,
+            KeyCode::End | KeyCode::Char('G') => self.files_sel = last,
+            KeyCode::PageUp => self.files_sel = self.files_sel.saturating_sub(10),
+            KeyCode::PageDown => self.files_sel = (self.files_sel + 10).min(last),
+            // A folder opens and shuts; a file narsil touched in this conversation is gone to.
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if row.dir => {
+                if row.open {
+                    self.files_folds.opened.remove(&row.path);
+                    self.files_folds.shut.insert(row.path.clone());
+                } else {
+                    self.files_folds.shut.remove(&row.path);
+                    self.files_folds.opened.insert(row.path.clone());
+                }
+                self.refresh_files(true);
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_file(&row),
+            // Left shuts the folder, or goes up to the one this is in.
+            KeyCode::Left | KeyCode::Char('h') if row.dir && row.open => {
+                self.files_folds.opened.remove(&row.path);
+                self.files_folds.shut.insert(row.path.clone());
+                self.refresh_files(true);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(up) = row.path.parent().and_then(|dir| self.files_rows.iter().position(|r| r.dir && r.path == dir)) {
+                    self.files_sel = up;
+                }
+            }
+            KeyCode::Esc => self.files_focus = false,
+            _ => return false,
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Open a window on one file: what narsil has done to it in this session,
+    /// latest first, and what stands changed in it against git.
+    fn open_file(&mut self, row: &files::Row) {
+        let root = self.session.as_ref().map(|s| s.root_id.clone()).unwrap_or_default();
+        let ops: Vec<files::Op> = self
+            .store
+            .file_history(&root)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, input, _, _, _, _, _, _, _, cwd, resolved)| {
+                let at = match resolved {
+                    Some(path) => std::path::PathBuf::from(path),
+                    None => crate::obsidian::lexical(&crate::tools::resolve(cwd, input.get("path").and_then(|p| p.as_str()).unwrap_or(""))),
+                };
+                at == row.path
+            })
+            .map(|(name, input, status, is_error, result, at, _, _, agent, _, _)| files::Op { name, input, status, is_error, result, at, agent })
+            .collect();
+        let mut lines = files::history(&ops);
+        if lines.is_empty() {
+            lines.push(match row.mark {
+                files::Mark::Disk => "Changed on disk during this session, by a command rather than a file tool.".to_string(),
+                _ => "narsil has not read or written this file in this session.".to_string(),
+            });
+        }
+        // What stands changed against git, which also shows what a command did to it.
+        let dir = row.path.parent().unwrap_or(std::path::Path::new("."));
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).arg("--").arg(&row.path).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success())
+        };
+        if let Some(out) = git(&["diff", "--no-color", "HEAD"]) {
+            let diff = String::from_utf8_lossy(&out.stdout);
+            let body: Vec<&str> = diff.lines().skip_while(|l| !l.starts_with("@@")).collect();
+            if !body.is_empty() {
+                lines.push(String::new());
+                lines.push("NOT YET COMMITTED".to_string());
+                lines.extend(body.iter().take(160).map(|l| l.to_string()));
+                if body.len() > 160 {
+                    lines.push(format!("… {} more lines", body.len() - 160));
+                }
+            } else if git(&["ls-files", "--error-unmatch"]).is_none() && row.path.is_file() {
+                lines.push(String::new());
+                lines.push("NOT YET COMMITTED".to_string());
+                lines.push("A new file, not in git yet.".to_string());
+            }
+        }
+        self.logs = None;
+        self.file_view = Some(row.anchor);
+        // What is on screen can be seen over a shoulder: credentials are masked here too.
+        let lines = lines.iter().map(|l| crate::secrets::kept(l)).collect();
+        self.overlay = Overlay::Text { title: files::short(&row.path), lines, scroll: 0 };
+        self.dirty = true;
+    }
+
+    /// How wide the explorer is, given the width of the window: nothing if it is hidden or there is no room.
+    fn files_width(&self, total: u16) -> u16 {
+        if !self.files_visible || total < 72 { 0 } else { (total / 4).clamp(26, 40) }
+    }
+
+    fn draw_files(&mut self, f: &mut Frame, area: Rect) {
+        let focus = self.files_focus;
+        let hint = if focus { " ↑↓ · enter open, go to · esc " } else { " + new  ~ changed  ○ read  ▶ now " };
+        let block = UiBlock::bordered()
+            .border_style(Style::new().fg(if focus { Color::LightBlue } else { Color::DarkGray }))
+            .title(" files ")
+            .title_bottom(hint);
+        let inner = block.inner(area);
+        let width = inner.width.saturating_sub(1) as usize;
+        let dim = Style::new().fg(Color::DarkGray);
+        let clip = |text: &str, room: usize| -> String {
+            if text.chars().count() > room { format!("{}…", text.chars().take(room.saturating_sub(1)).collect::<String>()) } else { text.to_string() }
+        };
+        // A path that is too long keeps its end: that is the part that says which file it is.
+        let tail = |text: &str, room: usize| -> String {
+            let n = text.chars().count();
+            if n > room { format!("…{}", text.chars().skip(n - room.saturating_sub(1)).collect::<String>()) } else { text.to_string() }
+        };
+        let colour = |mark: files::Mark| match mark {
+            files::Mark::Now => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            files::Mark::Created => Style::new().fg(Color::Green),
+            files::Mark::Changed => Style::new().fg(Color::Yellow),
+            files::Mark::Disk => Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            files::Mark::Read => Style::new().fg(Color::Cyan),
+            files::Mark::None => Style::new(),
+        };
+        // The directory itself, then the tree, then what was touched elsewhere.
+        let mut lines: Vec<Line<'static>> = vec![Line::styled(format!(" {}", tail(&files::short(std::path::Path::new(&self.here())), width)), dim.add_modifier(Modifier::BOLD))];
+        let mut selected_line = 0usize;
+        let mut now_line: Option<usize> = None;
+        let mut headed = false;
+        for (i, row) in self.files_rows.iter().enumerate() {
+            if row.elsewhere && !std::mem::replace(&mut headed, true) {
+                lines.push(Line::default());
+                lines.push(Line::styled(" ELSEWHERE", dim.add_modifier(Modifier::BOLD)));
+            }
+            let pad = "  ".repeat(row.depth);
+            let room = width.saturating_sub(pad.chars().count() + 3).max(6);
+            let (glyph, glyph_style, name_style) = if row.elsewhere {
+                (row.mark.glyph(), dim, dim)
+            } else if row.dir {
+                (if row.open { "▾" } else { "▸" }, dim, Style::new().fg(Color::LightBlue))
+            } else {
+                (row.mark.glyph(), colour(row.mark), if row.mark == files::Mark::None { Style::new() } else { colour(row.mark) })
+            };
+            let name = if row.elsewhere { tail(&row.name, room) } else { clip(&row.name, room) };
+            let mut spans = vec![Span::raw(format!(" {pad}")), Span::styled(format!("{glyph} "), glyph_style), Span::styled(name, name_style)];
+            // A shut folder still says that something happened inside it.
+            if row.dir && !row.open && row.mark != files::Mark::None {
+                spans.push(Span::styled(format!(" {}", row.mark.glyph()), colour(row.mark)));
+            }
+            let mut line = Line::from(spans);
+            if focus && i == self.files_sel {
+                selected_line = lines.len();
+                line = line.style(Style::new().bg(Color::LightBlue).fg(Color::Black));
+            }
+            if row.mark == files::Mark::Now && !row.dir && now_line.is_none() {
+                now_line = Some(lines.len());
+            }
+            lines.push(line);
+        }
+        if self.files_rows.is_empty() {
+            lines.push(Line::styled(" (empty)", dim));
+        }
+        // Keep in view the row the keyboard is on, or else the file being worked on.
+        let room = inner.height as usize;
+        let keep = if focus { selected_line } else { now_line.unwrap_or(0) };
+        let offset = keep.saturating_sub(room.saturating_sub(2)).min(lines.len().saturating_sub(room));
+        f.render_widget(Paragraph::new(lines.into_iter().skip(offset).take(room).collect::<Vec<_>>()).block(block), area);
     }
 
     /// Where this tab is working: the session's directory, or the one the next session will start in.
@@ -1848,6 +2200,10 @@ impl App {
                 }
             }
             "/keys" => self.want_keys = true,
+            "/daemonrestart" => {
+                self.flash("restarting the daemon…");
+                self.want_restart = true;
+            }
             "/back" => self.back().await,
             "/cd" => {
                 if arg.is_empty() {
@@ -1883,6 +2239,7 @@ impl App {
                 self.panel_hidden = !self.panel_hidden;
                 self.panel_focus = false;
             }
+            "/files" => self.toggle_files(),
             "/logs" => {
                 // This session's lines if there is one, everything if not; `/logs errors` opens on the errors.
                 let min = match arg.trim() {
@@ -1895,6 +2252,7 @@ impl App {
             }
             "/trace" | "/stats" => {
                 self.logs = None;
+                self.file_view = None;
                 let cmd = if cmd == "/trace" { "/trace" } else { "/stats" };
                 let Some(lines) = self.live_lines(cmd) else {
                     self.flash("no session open yet");
@@ -1965,6 +2323,21 @@ impl App {
             self.overlay_key(key).await;
             return;
         }
+        let action = self.keys.action(&key);
+        if self.files_focus && action != Some(Action::Files) {
+            if self.files_key(key) {
+                return;
+            }
+            // Anything else (typing, ctrl keys, the other panel's key) leaves it.
+            self.files_focus = false;
+        }
+        if self.panel_focus && action == Some(Action::Panel) {
+            // Its key again pops it back out.
+            self.panel_focus = false;
+            self.panel_hidden = true;
+            self.dirty = true;
+            return;
+        }
         if self.panel_focus {
             if key.code == KeyCode::Enter {
                 let target = self.nav().into_iter().filter(|n| n.anchor.is_some()).nth(self.panel_sel).and_then(|n| n.open);
@@ -1980,7 +2353,6 @@ impl App {
             self.panel_focus = false;
         }
 
-        let action = self.keys.action(&key);
         if action != Some(Action::Panel) && key.code != KeyCode::BackTab {
             // Any other key ends a run through the matching commands.
             self.completing = None;
@@ -1999,7 +2371,16 @@ impl App {
             }
             Some(Action::Panel) => {
                 if !self.complete_command(false) {
-                    self.to_panel();
+                    self.toggle_panel();
+                }
+                return;
+            }
+            Some(Action::Files) => {
+                // While walking through the commands that fit, shift+tab walks back.
+                if self.completing.is_some() && key.code == KeyCode::BackTab {
+                    self.complete_command(true);
+                } else {
+                    self.toggle_files();
                 }
                 return;
             }
@@ -2059,7 +2440,7 @@ impl App {
             // Shift+tab walks back through the matching commands, or goes to the panel like tab.
             KeyCode::BackTab => {
                 if !self.complete_command(true) {
-                    self.to_panel();
+                    self.toggle_panel();
                 }
             }
             KeyCode::Char(c) if !ctrl && !alt => {
@@ -2112,7 +2493,17 @@ impl App {
         if close {
             self.overlay = Overlay::None;
             self.logs = None;
+            self.file_view = None;
             return;
+        }
+        // From a file's history, enter goes to where it was last touched in the conversation.
+        if code == KeyCode::Enter && matches!(self.overlay, Overlay::Text { .. }) {
+            if let Some(Some(anchor)) = self.file_view.take() {
+                self.overlay = Overlay::None;
+                self.files_focus = false;
+                self.jump = Some(anchor);
+                return;
+            }
         }
         let page = self.view_h.saturating_sub(4).max(1);
         let mut open: Option<String> = None;
@@ -2437,7 +2828,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.panel_sel = last,
             KeyCode::PageUp => self.scroll_by(page),
             KeyCode::PageDown => self.scroll_by(-page),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter => self.panel_focus = false,
+            KeyCode::Enter => self.panel_focus = false,
             KeyCode::Esc => {
                 self.panel_focus = false;
                 self.scroll = 0;
@@ -2541,7 +2932,17 @@ impl App {
         ])
         .areas(area);
         self.draw_header(f, header);
-        let panel_w = self.panel_width(area.width);
+        // The explorer on the left, when it is shown and there is room for it.
+        let files_w = self.files_width(area.width);
+        let body = if files_w > 0 {
+            let [left, rest] = Layout::horizontal([Constraint::Length(files_w), Constraint::Min(40)]).areas(body);
+            self.draw_files(f, left);
+            rest
+        } else {
+            self.files_focus = false;
+            body
+        };
+        let panel_w = self.panel_width(area.width.saturating_sub(files_w));
         self.panel_visible = panel_w > 0;
         if !self.panel_visible {
             self.panel_focus = false;
@@ -2885,9 +3286,13 @@ impl App {
                 None,
                 "e errors · w warnings · i info · a all · s this session/all · / find · c clear · f follow · esc close",
             ),
+            Overlay::Text { title, lines, .. } if matches!(self.file_view, Some(Some(_))) => {
+                (title.clone(), lines.clone(), None, "↑↓ scroll · enter go to it in the conversation · esc close")
+            }
             Overlay::Text { title, lines, .. } => (title.clone(), lines.clone(), None, "↑↓ scroll · esc close"),
         };
         let logs = self.showing_logs();
+        let file = self.file_view.is_some() && matches!(self.overlay, Overlay::Text { .. });
         // Log lines are long: the log gets the width of the window.
         let widest = if logs { 400 } else { 100 };
         let w = area.width.saturating_sub(6).clamp(20, widest).min(area.width);
@@ -2926,6 +3331,16 @@ impl App {
                         Some(0) => Style::new().fg(Color::Red),
                         Some(1) => Style::new().fg(Color::Yellow),
                         Some(2) => Style::new().fg(Color::DarkGray),
+                        _ => Style::new(),
+                    };
+                    Line::styled(format!(" {text}"), style)
+                } else if file {
+                    // What was put in and taken out, as a diff is read; each step and heading stands out.
+                    let style = match l.trim_start().chars().next() {
+                        Some('+') => Style::new().fg(Color::Green),
+                        Some('-') => Style::new().fg(Color::Red),
+                        Some('@') => Style::new().fg(Color::Cyan),
+                        _ if l.starts_with(|c: char| c.is_ascii_digit()) || l == "NOT YET COMMITTED" => Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
                         _ => Style::new(),
                     };
                     Line::styled(format!(" {text}"), style)

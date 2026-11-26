@@ -36,8 +36,8 @@ the latest release's binary for this machine, checked against the published chec
 in. The daemon is then restarted so that the new version is the one running: sessions and work in
 flight are suspended and picked up again. `--no-restart` leaves the daemon as it is.
 
-If narsil is updated some other way, `narsil restart` does the second half; the TUI and `narsil
-status` say when the daemon is older than the program on disk.
+If narsil is updated some other way, `narsil restart` (or `/daemonrestart` in the TUI) does the
+second half; the TUI and `narsil status` say when the daemon is older than the program on disk.
 
 ## Commands
 

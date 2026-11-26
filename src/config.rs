@@ -141,6 +141,7 @@ pub struct KeysConfig {
     pub voice: String,
     pub scroll_up: String,
     pub scroll_down: String,
+    pub files: String,
     pub quit: String,
 }
 
@@ -161,6 +162,7 @@ impl Default for KeysConfig {
             voice: "f2".into(),
             scroll_up: "pageup".into(),
             scroll_down: "pagedown".into(),
+            files: "shift+tab".into(),
             quit: "ctrl+d".into(),
         }
     }
@@ -183,6 +185,7 @@ impl KeysConfig {
             "voice" => &self.voice,
             "scroll_up" => &self.scroll_up,
             "scroll_down" => &self.scroll_down,
+            "files" => &self.files,
             "quit" => &self.quit,
             _ => "",
         }
@@ -778,7 +781,7 @@ pub fn render_config(c: &Config) -> String {
     s.push_str("# The keys window in the TUI (f1, or /keys) lists what is in force. Editing keys are fixed.\n");
     for name in [
         "new_tab", "close_tab", "next_tab", "prev_tab", "goto_tab", "keys", "interrupt", "panel", "expand_tools", "thinking", "voice",
-        "scroll_up", "scroll_down", "quit",
+        "scroll_up", "scroll_down", "files", "quit",
     ] {
         s.push_str(&format!("{name} = {}\n", q(c.keys.get(name))));
     }

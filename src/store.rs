@@ -942,6 +942,68 @@ impl Store {
 
     /// The journaled state of every call still marked as running, with its
     /// tool: after a crash, what the dead daemon had in hand.
+    /// The calls to the file tools made by a session and its subagents, in
+    /// order: tool, input, status, whether it failed, how its result begins,
+    /// the message that asked for it, the session, that session's directory,
+    /// and the file as it resolved when the call ran (if that was recorded).
+    #[allow(clippy::type_complexity)]
+    pub fn file_calls(&self, root: &str) -> Result<Vec<(String, Value, String, bool, String, i64, String, String, Option<String>)>> {
+        let db = self.db();
+        let mut stmt = db.prepare(
+            "SELECT t.name, t.input, t.status, t.is_error, substr(COALESCE(t.result, ''), 1, 24), t.message_id, s.id, s.cwd, json_extract(t.state, '$.path') \
+             FROM tool_calls t JOIN sessions s ON s.id = t.session_id \
+             WHERE s.root_id = ?1 AND t.name IN ('read_file', 'write_file', 'edit_file') ORDER BY t.rowid",
+        )?;
+        let rows = stmt.query_map(params![root], |r| {
+            let input: String = r.get(1)?;
+            Ok((
+                r.get(0)?,
+                serde_json::from_str(&input).unwrap_or(Value::Null),
+                r.get(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The same calls with all of their input and when they ran, latest first:
+    /// for showing what was done to one file. Each: tool, input, status,
+    /// whether it failed, how its result begins, when it started, the message
+    /// that asked for it, the session, the subagent's name if it was one, that
+    /// session's directory, and the file as it resolved then.
+    #[allow(clippy::type_complexity)]
+    pub fn file_history(&self, root: &str) -> Result<Vec<(String, Value, String, bool, String, i64, i64, String, String, String, Option<String>)>> {
+        let db = self.db();
+        let mut stmt = db.prepare(
+            "SELECT t.name, t.input, t.status, t.is_error, substr(COALESCE(t.result, ''), 1, 200), COALESCE(t.started_at, 0), t.message_id, \
+             s.id, COALESCE(s.agent_name, ''), s.cwd, json_extract(t.state, '$.path') \
+             FROM tool_calls t JOIN sessions s ON s.id = t.session_id \
+             WHERE s.root_id = ?1 AND t.name IN ('read_file', 'write_file', 'edit_file') ORDER BY t.rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![root], |r| {
+            let input: String = r.get(1)?;
+            Ok((
+                r.get(0)?,
+                serde_json::from_str(&input).unwrap_or(Value::Null),
+                r.get(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn running_tool_states(&self) -> Result<Vec<(i64, String, Value)>> {
         let db = self.db();
         let mut stmt =

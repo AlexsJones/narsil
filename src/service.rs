@@ -38,6 +38,15 @@ pub async fn ping(paths: &Paths) -> Option<serde_json::Value> {
     tokio::time::timeout(Duration::from_secs(3), conn.call(Command::Status)).await.ok()?.ok()
 }
 
+/// The narsil program to run in order to restart the daemon: the one this was
+/// started as, found afresh, so that after an update it is the new one. (The
+/// file this process itself runs from may have been replaced and be gone.)
+pub fn program() -> std::path::PathBuf {
+    let started_as = std::env::args_os().next().map(std::path::PathBuf::from).unwrap_or_else(|| "narsil".into());
+    // With a folder in it, it names a file; a bare name is looked up on the PATH when it is run.
+    if started_as.components().count() > 1 && started_as.exists() { started_as } else { "narsil".into() }
+}
+
 /// What to say if the running daemon was started before the narsil program
 /// on disk was last replaced (an upgrade, a rebuild): it is still the old
 /// version, and none of what is new is in force until it is restarted.
@@ -49,7 +58,7 @@ pub fn outdated(status: &serde_json::Value) -> Option<String> {
     // A daemon started by this very program begins a moment after the file was written.
     (replaced > started + Duration::from_secs(2)).then(|| {
         "narsil has been updated since its daemon started, so the daemon is still the older version. \
-         Run `narsil restart` to use the new one: sessions and work in flight are kept. (`narsil update` does both.)"
+         Run `narsil restart` (or /daemonrestart in the TUI) to use the new one: sessions and work in flight are kept."
             .to_string()
     })
 }
@@ -58,8 +67,24 @@ fn read_pid(paths: &Paths) -> Option<i32> {
     std::fs::read_to_string(paths.pid_file()).ok()?.trim().parse().ok()
 }
 
+/// Whether a process is still running. One that has exited but has not been
+/// collected by whoever started it (a TUI that started the daemon and is still
+/// open) still has its number, and is not running.
 fn pid_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    // Linux says what state it is in; elsewhere `ps` does.
+    let state = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // "1234 (name) S ...": the state follows the name, which may itself hold spaces and brackets.
+        Ok(stat) => stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()),
+        Err(_) => std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().chars().next()),
+    };
+    state != Some('Z')
 }
 
 /// Start the daemon in the background and wait until it answers.
@@ -91,7 +116,12 @@ pub async fn start(paths: &Paths, quiet: bool) -> Result<()> {
                 Ok(())
             });
         }
-        cmd.spawn().context("starting the daemon")?;
+        let mut daemon = cmd.spawn().context("starting the daemon")?;
+        // If this process outlives the daemon (a TUI that started it), collect it when it
+        // exits, so that it does not linger as a process that has ended but still has a number.
+        std::thread::spawn(move || {
+            let _ = daemon.wait();
+        });
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {

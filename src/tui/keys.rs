@@ -21,6 +21,7 @@ pub enum Action {
     Quit,
     ScrollUp,
     ScrollDown,
+    Files,
 }
 
 /// One key with its modifiers.
@@ -132,7 +133,7 @@ pub struct KeyMap {
 }
 
 /// Every rebindable action: its name in `[keys]`, what it does, and the group it is listed under.
-const ACTIONS: [(Action, &str, &str, &str); 14] = [
+const ACTIONS: [(Action, &str, &str, &str); 15] = [
     (Action::NewTab, "new_tab", "open a new tab with a fresh session", "Tabs"),
     (Action::CloseTab, "close_tab", "close this tab (its work carries on)", "Tabs"),
     (Action::NextTab, "next_tab", "next tab", "Tabs"),
@@ -140,12 +141,13 @@ const ACTIONS: [(Action, &str, &str, &str); 14] = [
     (Action::GotoTab, "goto_tab", "then 1 … 9: go to that tab (or ←/→, t new, w close)", "Tabs"),
     (Action::Keys, "keys", "show this list", "Tabs"),
     (Action::Interrupt, "interrupt", "interrupt the agent; from a subagent, go back", "Session"),
-    (Action::Panel, "panel", "complete a command, or focus the side panel", "Session"),
+    (Action::Panel, "panel", "complete a command; else pop the goal and work panel in and out", "Session"),
     (Action::ExpandTools, "expand_tools", "expand or fold tool output", "Session"),
     (Action::Thinking, "thinking", "show or hide the model's thinking", "Session"),
     (Action::Voice, "voice", "start or stop voice input", "Session"),
     (Action::ScrollUp, "scroll_up", "scroll the conversation up", "Session"),
     (Action::ScrollDown, "scroll_down", "scroll the conversation down", "Session"),
+    (Action::Files, "files", "pop the file explorer in and out", "Session"),
     (Action::Quit, "quit", "leave narsil (work carries on)", "Session"),
 ];
 
@@ -283,6 +285,8 @@ mod tests {
         assert_eq!(map.action(&key(KeyCode::F(1), KeyModifiers::NONE)), Some(Action::Keys));
         assert_eq!(map.action(&key(KeyCode::Char('k'), KeyModifiers::ALT)), Some(Action::Keys));
         assert_eq!(map.action(&key(KeyCode::Tab, KeyModifiers::NONE)), Some(Action::Panel));
+        assert_eq!(map.action(&key(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(Action::Files), "shift+tab, as a terminal reports it");
+        assert_eq!(map.label(Action::Files), "shift+tab");
         assert_eq!(map.action(&key(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::Interrupt));
         assert_eq!(map.action(&key(KeyCode::Char('t'), KeyModifiers::NONE)), None, "plain typing is never an action");
         assert_eq!(map.action(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)), Some(Action::GotoTab));
