@@ -48,7 +48,7 @@ pub fn memory_save(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let engine = ctx.engine;
     let entry = memory::Entry { scope: &scope, kind, title, body, source: Some(&ctx.session.id) };
     let saved = memory::save(&engine.store, ctx.cfg, &engine.paths, &entry)?;
-    let mut out = format!("Saved to {which} memory: {title}");
+    let mut out = format!("Saved to {which} memory: {title}.{}", crate::secrets::masked_note(&format!("{title}\n{body}")));
     if !saved.links.is_empty() {
         out.push_str(&format!("\nLinks to: {}", link_list(&saved.links)));
     }

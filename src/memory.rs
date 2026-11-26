@@ -363,7 +363,10 @@ pub struct Saved {
 /// Save an entry, replacing the one with the same title in the same scope.
 pub fn save(store: &Store, cfg: &Config, paths: &Paths, entry: &Entry<'_>) -> Result<Saved> {
     let Entry { scope, kind, source, .. } = *entry;
-    let (title, body) = (entry.title.trim(), entry.body.trim());
+    // Memory is plain text that is read into later sessions, and may sync to other
+    // machines: a credential does not belong in it.
+    let (title, body) = (crate::secrets::kept(entry.title.trim()), crate::secrets::kept(entry.body.trim()));
+    let (title, body) = (title.as_str(), body.as_str());
     if title.is_empty() || body.is_empty() {
         bail!("a memory entry needs a title and a body");
     }

@@ -8,6 +8,7 @@ mod engine;
 mod goals;
 mod memory;
 mod obsidian;
+mod secrets;
 mod proto;
 mod provider;
 mod service;

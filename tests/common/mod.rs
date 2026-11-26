@@ -106,6 +106,7 @@ impl Narsil {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("home")).unwrap();
         std::fs::create_dir_all(base.join("dirs")).unwrap();
+        std::fs::create_dir_all(base.join("user")).unwrap();
         let narsil = Narsil { base, runtime };
         let mut args = vec!["setup", "--yes"];
         args.extend(backend);
@@ -121,6 +122,12 @@ impl Narsil {
 
     pub fn home(&self) -> PathBuf {
         self.base.join("home")
+    }
+
+    /// The home directory narsil and the commands it runs see as `~`: the
+    /// instance's own, so that no test can reach the real one.
+    pub fn user_home(&self) -> PathBuf {
+        std::fs::canonicalize(self.base.join("user")).unwrap()
     }
 
     /// A directory to work in, made if it is not there.
@@ -145,6 +152,7 @@ impl Narsil {
         c.args(args)
             .current_dir(cwd)
             .env("NARSIL_HOME", self.home())
+            .env("HOME", self.base.join("user"))
             .env("NARSIL_RUNTIME_DIR", &self.runtime)
             .env_remove("NARSIL_LOG")
             .stdin(std::process::Stdio::null());

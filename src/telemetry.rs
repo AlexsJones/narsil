@@ -449,6 +449,51 @@ pub fn lines_of<'a>(log: &'a str, id: &str) -> Vec<&'a str> {
     out
 }
 
+/// How serious a line of the log is: 0 trace and debug, 1 info, 2 warn, 3 error.
+pub fn line_level(line: &str) -> Option<u8> {
+    static LEVEL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^\d{4}-\d\d-\d\d \S+\s+(TRACE|DEBUG|INFO|WARN|ERROR) ").expect("a valid pattern"));
+    LEVEL.captures(line).map(|c| match &c[1] {
+        "ERROR" => 3,
+        "WARN" => 2,
+        "INFO" => 1,
+        _ => 0,
+    })
+}
+
+/// The lines of a log to show: at or above a level, of one session (with its
+/// subagents) or goal if `owner` is given, and holding `find` if that is not
+/// empty. A line that continues another goes or stays with it. The date is
+/// dropped from each line: it is the time that is wanted on screen.
+pub fn log_view(log: &str, min_level: u8, owner: Option<&str>, find: &str) -> Vec<String> {
+    let find = find.trim().to_lowercase();
+    let mut out = Vec::new();
+    // Each entry: its first line and the lines that continue it.
+    let mut entry: Vec<&str> = Vec::new();
+    let mut flush = |entry: &mut Vec<&str>| {
+        let Some(first) = entry.first() else { return };
+        let wanted = line_level(first).unwrap_or(1) >= min_level
+            && owner.is_none_or(|id| line_owner(first).is(id))
+            && (find.is_empty() || entry.iter().any(|l| l.to_lowercase().contains(&find)));
+        if wanted {
+            for (i, line) in entry.iter().enumerate() {
+                out.push(if i == 0 { line.get(11..).unwrap_or(line).to_string() } else { line.to_string() });
+            }
+        }
+        entry.clear();
+    };
+    for line in log.lines() {
+        if line_level(line).is_some() {
+            flush(&mut entry);
+        }
+        if !entry.is_empty() || line_level(line).is_some() {
+            entry.push(line);
+        }
+    }
+    flush(&mut entry);
+    out
+}
+
 /// What an event says, apart from whose it is: its message, then its other fields.
 #[derive(Default)]
 struct Said {
@@ -537,6 +582,8 @@ type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 /// Install logging for this process, and span recording for the daemon.
 /// Returns a guard to keep until the process ends.
 pub fn init(role: Role, paths: &Paths, cfg: &Config) -> Guard {
+    // Every process that shows or keeps anything starts here.
+    crate::secrets::set_masking(cfg.permissions.mask_secrets);
     let configured = if role == Role::Cli { "warn" } else { cfg.telemetry.level.as_str() };
     let wanted = std::env::var("NARSIL_LOG").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| configured.to_string());
     // A bare `debug` or `trace` means narsil's own detail, not the HTTP library's connection chatter.
@@ -672,6 +719,10 @@ fn depths(spans: &[SpanRow]) -> HashMap<i64, usize> {
 
 /// One line per span, in the order things happened, indented by nesting.
 pub fn timeline(spans: &[SpanRow], now: i64) -> Vec<String> {
+    in_order(spans, now).iter().map(|line| crate::secrets::kept(line)).collect()
+}
+
+fn in_order(spans: &[SpanRow], now: i64) -> Vec<String> {
     let Some(first) = spans.iter().map(|s| s.start_ms).min() else { return vec!["nothing recorded".to_string()] };
     let depth = depths(spans);
     spans
@@ -1020,6 +1071,11 @@ impl Notes {
 /// model said, the tool calls it asked for beneath it with what came back, and
 /// a subagent's whole run beneath the call that started it.
 pub fn tree(spans: &[SpanRow], notes: &Notes, now: i64, width: usize) -> Vec<String> {
+    // A trace is read by people and pasted into issues: no credentials in it.
+    walked(spans, notes, now, width).iter().map(|line| crate::secrets::kept(line)).collect()
+}
+
+fn walked(spans: &[SpanRow], notes: &Notes, now: i64, width: usize) -> Vec<String> {
     if spans.is_empty() {
         return vec!["nothing recorded".to_string()];
     }
@@ -1237,6 +1293,31 @@ mod tests {
         assert_eq!(of("gggg9999"), ["14:00:04.000", "14:00:05.000"]);
         assert!(lines_of(log, "zzzz0000").is_empty());
         assert_eq!(line_owner("2026-11-26 14:00:06.000  INFO work: 3 notes read"), Who::default());
+    }
+
+    #[test]
+    fn a_log_is_narrowed_by_level_by_owner_and_by_what_it_says() {
+        let log = "\
+2026-11-26 14:00:00.000  INFO narsil daemon 0.1.0 starting (pid 1)
+2026-11-26 14:00:01.000 DEBUG [aaaa1111] tool call finished tool=bash
+2026-11-26 14:00:02.000  INFO [aaaa1111] model call used 10 input tokens
+2026-11-26 14:00:03.000  WARN [aaaa1111>bbbb2222 count-two] the backend said no
+  Timeout after 30s
+2026-11-26 14:00:04.000 ERROR [cccc3333] session run failed: boom
+2026-11-26 14:00:05.000  INFO [cccc3333] model call used 20 input tokens
+";
+        let times = |lines: Vec<String>| lines.iter().map(|l| l.split_whitespace().next().unwrap_or("").to_string()).collect::<Vec<_>>();
+        assert_eq!(log_view(log, 0, None, "").len(), 7, "everything, with the line that continues another");
+        assert!(log_view(log, 0, None, "")[0].starts_with("14:00:00.000  INFO narsil daemon"), "the date is dropped");
+        assert_eq!(times(log_view(log, 1, None, "")), ["14:00:00.000", "14:00:02.000", "14:00:03.000", "Timeout", "14:00:04.000", "14:00:05.000"]);
+        assert_eq!(times(log_view(log, 2, None, "")), ["14:00:03.000", "Timeout", "14:00:04.000"], "warnings and errors");
+        assert_eq!(times(log_view(log, 3, None, "")), ["14:00:04.000"], "errors only");
+        assert_eq!(times(log_view(log, 0, Some("aaaa1111"), "")), ["14:00:01.000", "14:00:02.000", "14:00:03.000", "Timeout"], "a session with its subagent");
+        assert_eq!(times(log_view(log, 2, Some("aaaa1111"), "")), ["14:00:03.000", "Timeout"]);
+        assert_eq!(times(log_view(log, 0, None, "TIMEOUT")), ["14:00:03.000", "Timeout"], "found in a continuation line, whatever the case");
+        assert_eq!(times(log_view(log, 0, Some("cccc3333"), "model call")), ["14:00:05.000"]);
+        assert!(log_view(log, 3, Some("aaaa1111"), "").is_empty() && log_view("", 0, None, "").is_empty());
+        assert_eq!((line_level("2026-11-26 14:00:04.000 ERROR x"), line_level("  Timeout after 30s")), (Some(3), None));
     }
 
     #[test]

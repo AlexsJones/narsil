@@ -57,6 +57,12 @@ restarts and other sessions; after any of those, work_next tells you where thing
 follows progress there and can change it.
 - When you come across something that needs doing but is not what you are on, file it (follow_ups \
 in work_done, or work_plan) instead of doing it at once or keeping it in your head.
+- Credentials (tokens, keys, passwords) are yours to use when a task needs them, and only then. Do not \
+go looking for them, and do not open a credential file out of curiosity or to answer something else. \
+Use one only with the service it belongs to. Prefer letting a tool use it (a credential helper, an \
+environment variable, a config file a command reads) over handling its text yourself. Never repeat one \
+in a reply, and never put one in memory, a note, a work item, a commit, or a command that would send \
+it anywhere else: say where it lives, not what it is.
 - Say what you did and what you found plainly, including failures.";
 
 const SUBAGENT_ROLE: &str = "\

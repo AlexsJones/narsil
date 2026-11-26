@@ -376,7 +376,8 @@ fn render(item: &Item, width: usize, expanded: bool, spin: usize, cwd: &str) -> 
                 // Anything that reaches into the user's Obsidian vault is marked as such.
                 let vault = touches_vault(name, input, cwd);
                 let used = 2 + name.chars().count() + 1 + if vault { 2 } else { 0 };
-                let summary = first_line(&relative(&summarize_call(name, input)), width.saturating_sub(used).max(10));
+                // What is on screen can be seen over a shoulder or in a screenshot: credentials are masked here.
+                let summary = first_line(&crate::secrets::kept(&relative(&summarize_call(name, input))), width.saturating_sub(used).max(10));
                 let mut spans = vec![Span::styled(format!("{mark} "), mark_style)];
                 let mut named = Style::new().add_modifier(Modifier::BOLD);
                 if vault {
@@ -389,7 +390,7 @@ fn render(item: &Item, width: usize, expanded: bool, spin: usize, cwd: &str) -> 
             // The agent rows already say how each one ended; the full reports are one keypress away.
             let show_output = output.is_some() && (!roster || expanded);
             if let (Some(out), true) = (output, show_output) {
-                let all = wrap(relative(out).trim_end(), width.saturating_sub(4));
+                let all = wrap(crate::secrets::kept(&relative(out)).trim_end(), width.saturating_sub(4));
                 let limit = if expanded { 400 } else { 5 };
                 let style = if *is_error { Style::new().fg(Color::Red) } else { dim() };
                 for (i, piece) in all.iter().take(limit).enumerate() {

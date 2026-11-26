@@ -394,6 +394,10 @@ pub struct PermissionsConfig {
     pub allow: Vec<String>,
     /// Shell commands refused outright, matched as substrings.
     pub deny: Vec<String>,
+    /// Mask anything shaped like a token or a private key in what narsil
+    /// writes down to keep (memory, work notes, a goal's journal) and in what
+    /// it shows (the TUI, traces). The agent itself still sees and can use it.
+    pub mask_secrets: bool,
 }
 
 impl Default for PermissionsConfig {
@@ -412,6 +416,7 @@ impl Default for PermissionsConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            mask_secrets: true,
         }
     }
 }
@@ -681,7 +686,11 @@ pub fn render_config(c: &Config) -> String {
     s.push_str("# Simple commands starting with one of these never ask.\n");
     s.push_str(&format!("allow = {}\n", qlist(&c.permissions.allow)));
     s.push_str("# Commands containing one of these are always refused.\n");
-    s.push_str(&format!("deny = {}\n\n", qlist(&c.permissions.deny)));
+    s.push_str(&format!("deny = {}\n", qlist(&c.permissions.deny)));
+    s.push_str("# The agent can read and use credentials. This keeps them from spreading: anything shaped like\n");
+    s.push_str("# a token or a private key is masked in what narsil writes down to keep (memory, work notes,\n");
+    s.push_str("# a goal's journal) and in what it shows (the TUI, traces).\n");
+    s.push_str(&format!("mask_secrets = {}\n\n", c.permissions.mask_secrets));
 
     s.push_str("[privilege]\n");
     s.push_str("# Let the agent use sudo. Setup checks wheel membership; unattended runs also\n");

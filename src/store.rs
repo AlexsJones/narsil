@@ -1263,6 +1263,8 @@ impl Store {
     }
 
     pub fn goal_log(&self, id: &str, kind: &str, text: &str) -> Result<()> {
+        // The journal is shown, and written into the goal's note: no credentials in it.
+        let text = &crate::secrets::kept(text);
         self.db().execute(
             "INSERT INTO goal_log (goal_id, ts, kind, text) VALUES (?1,?2,?3,?4)",
             params![id, now(), kind, text],

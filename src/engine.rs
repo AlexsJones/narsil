@@ -109,6 +109,8 @@ pub struct Engine {
     failing: Mutex<HashMap<String, u32>>,
     /// Commands that failed in a session and have not yet worked: what kind of command, and its text.
     stumbles: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// The kinds of credential, and the credential stores, a session has already been told how to handle.
+    handled: Mutex<HashMap<String, HashSet<String>>>,
     shutting_down: AtomicBool,
 }
 
@@ -277,6 +279,7 @@ impl Engine {
             off_the_books: Mutex::new(HashMap::new()),
             failing: Mutex::new(HashMap::new()),
             stumbles: Mutex::new(HashMap::new()),
+            handled: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -632,6 +635,33 @@ impl Engine {
              kind lesson: what fails, what works, and why. Scope it to the project unless it holds everywhere.",
             first_line(other, 100)
         ))
+    }
+
+    /// When what a tool returned holds a credential, or a credential store was
+    /// read, a line saying how to handle it: use it for the task and the
+    /// service it belongs to, and do not let it spread. The agent is not
+    /// stopped from reading or using it. Said once in a session for each kind
+    /// of credential and each store.
+    fn credential_reminder(&self, session: &Session, call: &ToolCall, output: &str) -> Option<String> {
+        let text = |key: &str| call.input.get(key).and_then(|v| v.as_str());
+        let store = match call.name.as_str() {
+            "bash" => text("command").and_then(|c| crate::secrets::named_in(c, std::path::Path::new(&session.cwd))),
+            "read_file" | "grep" => text("path").filter(|p| crate::secrets::is_store(&tools::resolve(&session.cwd, p))).map(str::to_string),
+            _ => None,
+        };
+        let holds = crate::secrets::kinds(output);
+        if holds.is_empty() && store.is_none() {
+            return None;
+        }
+        let mut told = self.handled.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = told.entry(session.root_id.clone()).or_default();
+        let new_kinds: Vec<&str> = holds.iter().copied().filter(|k| mine.insert(k.to_string())).collect();
+        let new_store = store.filter(|s| mine.insert(format!("store:{s}")));
+        if new_kinds.is_empty() && new_store.is_none() {
+            return None;
+        }
+        tracing::info!(session = %session.id, "a tool result held a credential; the agent was told how to handle it");
+        Some(crate::secrets::reminder(&new_kinds, new_store.as_deref()))
     }
 
     /// When a chat turn is about to end with something having failed and
@@ -1148,6 +1178,9 @@ impl Engine {
                 out.content.push_str(&reminder);
             }
             if let Some(reminder) = self.lesson_reminder(&session, &call, failed, &out.content) {
+                out.content.push_str(&reminder);
+            }
+            if let Some(reminder) = self.credential_reminder(&session, &call, &out.content) {
                 out.content.push_str(&reminder);
             }
             span.record("is_error", out.is_error).record("ok", !out.is_error).record("output_bytes", out.content.len() as u64);

@@ -829,6 +829,12 @@ impl<'a> Graph<'a> {
     }
 
     fn write(&self, item: &mut Item) -> Result<()> {
+        // A work note is kept, and read by whoever picks the work up: no credentials in it.
+        for text in [&mut item.body, &mut item.result, &mut item.log] {
+            if !crate::secrets::kinds(text).is_empty() {
+                *text = crate::secrets::kept(text);
+            }
+        }
         let all = load(self.store, Some(&item.project))?;
         save(self.store, &self.root, self.available, item, &all)
     }

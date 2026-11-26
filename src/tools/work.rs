@@ -194,7 +194,7 @@ pub fn work_done(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         engine.write_goal_note(goal);
     }
     let learned = crate::memory::save_learned(&engine.store, ctx.cfg, &engine.paths, &project, name, &ctx.session.id, input.get("learned"));
-    let mut out = format!("Closed {name:?}.");
+    let mut out = format!("Closed {name:?}.{}", crate::secrets::masked_note(&format!("{result}\n{evidence}")));
     if !learned.is_empty() {
         out.push_str(&format!(" Saved to memory for next time: {}.", learned.join("; ")));
     }
