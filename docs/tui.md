@@ -33,7 +33,7 @@ right arrow takes it, and more tabs walk through the others.
 
 Commands: `/new` `/sessions` `/resume <id>` `/continue` `/compact` `/goal <objective>` `/goals`
 `/pause` `/agents` `/back` `/cd <dir>` `/model [text]` `/provider [name]` `/memory [query]`
-`/remember <text>` `/forget <id>` `/trace` `/stats` `/keys` `/auto` `/ask` `/panel` `/reload`
+`/remember <text>` `/forget <id>` `/trace` `/stats` `/logs [errors]` `/cleargoal` `/clear` `/keys` `/auto` `/ask` `/panel` `/reload`
 `/title <text>` `/help`.
 
 The side panel appears when there is a goal, unfinished work in this directory, or subagents. It shows

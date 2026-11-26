@@ -236,3 +236,66 @@ fn a_reminder_comes_when_work_is_laid_out_and_none_of_it_is_taken() {
     // After eight calls with nothing taken; and not at all once an item is in hand.
     assert_eq!(reminded, vec![8], "{:#?}", session.calls_to("bash").iter().map(|c| &c.result).collect::<Vec<_>>());
 }
+
+#[test]
+fn a_request_that_turns_into_building_is_laid_out_under_what_was_asked() {
+    let narsil = Narsil::new();
+    let dir = narsil.dir("game");
+    let write = |name: &str| format!(r#"!tool write_file {{"path":"{name}","content":"x"}}"#);
+    let steps = [
+        write("index.html"),
+        write("game.js"),
+        write("style.css"),
+        r#"!tool work_plan {"directory":".","items":[{"title":"Draw the board"},{"title":"Handle the keys","blocked_by":["Draw the board"]}]}"#.to_string(),
+        write("keys.js"),
+        "!say Under way.".to_string(),
+    ];
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    // Asked in passing, not given as a goal.
+    let session = narsil.ask(&dir, &format!("Build me a small game for the browser.\n{}", script(&steps)));
+
+    // On the third file, with nothing laid out, it is told to lay the work out: once.
+    let writes = session.calls_to("write_file");
+    let told: Vec<bool> = writes.iter().map(|c| c.result.contains("[narsil] This has become more than a couple of steps")).collect();
+    assert_eq!(told, vec![false, false, true, false], "{writes:#?}");
+    assert!(writes[2].result.contains("work_plan") && writes[2].result.contains("side panel"), "{}", writes[2].result);
+
+    // The plan hangs under what was asked, as a goal's does under its objective: that is what the panel shows.
+    assert_eq!(narsil.text("SELECT title FROM work_items WHERE parent IS NULL", &[]), "Build me a small game for the browser.");
+    assert_eq!(narsil.column("SELECT title FROM work_items WHERE parent IS NOT NULL ORDER BY rowid", &[]), vec!["Draw the board", "Handle the keys"]);
+
+    // A small job never sees any of this.
+    let quick = narsil.ask(&narsil.dir("fix"), &script(&[&write("a.txt"), &write("b.txt"), "!say Fixed."]));
+    assert!(quick.calls().iter().all(|c| !c.result.contains("more than a couple of steps")));
+    // Nor does work that is already laid out and going.
+    let more = narsil.ask(&dir, &script(&[&write("one.js"), &write("two.js"), &write("three.js"), "!say More."]));
+    assert!(more.calls().iter().all(|c| !c.result.contains("more than a couple of steps")), "{:#?}", more.calls());
+}
+
+#[test]
+fn clearing_drops_what_is_unfinished_and_keeps_what_was_done() {
+    let narsil = Narsil::new();
+    let dir = narsil.dir("abandoned");
+    let steps = script(&[
+        r#"!tool work_plan {"directory":".","root":"Old idea","items":[{"title":"First part"},{"title":"Second part"},{"title":"Third part","blocked_by":["Second part"]}]}"#,
+        r#"!tool work_next {"claim":"First part"}"#,
+        &format!(r#"!tool work_done {{"item":"First part","result":"The first part is done.",{DONE}}}"#),
+        r#"!tool work_next {"claim":"Second part"}"#,
+        "!say Stopping here.",
+    ]);
+    narsil.ask(&dir, &steps);
+    assert_eq!(narsil.item("Second part"), "in_progress");
+
+    let said = narsil.ok(&dir, &["work", "--clear"]);
+    assert!(said.starts_with("dropped 3 unfinished items"), "{said}");
+    let status = |title: &str| narsil.item(title);
+    assert_eq!((status("First part"), status("Second part"), status("Third part"), status("Old idea")), ("done".into(), "dropped".into(), "dropped".into(), "dropped".into()));
+    // On record as the user's doing, in the note itself.
+    let (_, note) = narsil.note(&narsil.work(), "Second part").expect("the item's note");
+    assert!(note.contains("status: dropped") && note.contains("cleared by the user"), "{note}");
+    assert_eq!(narsil.ok(&dir, &["work", "--clear"]).trim(), "nothing unfinished here");
+
+    // A new session here starts with a clean slate, not with someone's abandoned plan.
+    let fresh = narsil.ask(&dir, "What is there to do?");
+    assert!(!fresh.prompt().contains("Ready now") && !fresh.prompt().contains("Second part"), "{}", fresh.prompt());
+}

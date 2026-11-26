@@ -51,6 +51,17 @@ Every employer appears on /work with role, dates and one line on what I did.
 
 `narsil work` prints the graph for the current directory; the TUI side panel shows it live.
 
+## Without a goal
+
+Work does not have to be given as a goal to be laid out. Ask for something in passing ("build me a
+game for the browser") and, once the agent is on its third file with no plan, narsil tells it to make
+one. The plan hangs under what you asked for, as a goal's does under its objective, and shows in the
+side panel with its progress. A one-file fix never sees any of this.
+
+`/cleargoal` clears the panel when you are done with a plan or have changed your mind: what is
+unfinished in this directory is dropped (and this session's goal cancelled, if it has one), and what
+was done stays on record as done. `narsil work --clear` does the same from the shell.
+
 ## Subagents
 
 The agent decides when to hand independent pieces of work to subagents, and can give each a ready

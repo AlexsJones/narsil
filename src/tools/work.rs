@@ -74,7 +74,15 @@ pub fn work_plan(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
         .then(|| ctx.engine.store.goal_get(&goal).ok().flatten())
         .flatten()
         .map(|g| crate::util::first_line(&g.objective, 70));
-    let root = opt_str(input, "root").map(str::to_string).or(goal_title);
+    // In a chat, the same: the plan hangs under what the user asked for, so the panel shows the
+    // request with its steps beneath it. (A line that starts with `!` is a script for the mock
+    // model, not a request.)
+    let asked = (goal.is_empty() && ctx.session.parent_id.is_none() && specs.len() >= 2)
+        .then(|| engine.store.last_request(&ctx.session.id))
+        .flatten()
+        .filter(|line| !line.starts_with('!') && !line.starts_with('/'))
+        .map(|line| crate::util::first_line(&line, 70));
+    let root = opt_str(input, "root").map(str::to_string).or(goal_title).or(asked);
     let touched = {
         let graph = Graph::open(&engine.store, ctx.cfg, &engine.paths);
         graph.plan(by(ctx), &project, &goal, root.as_deref(), &specs)?

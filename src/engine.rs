@@ -109,6 +109,8 @@ pub struct Engine {
     failing: Mutex<HashMap<String, u32>>,
     /// Commands that failed in a session and have not yet worked: what kind of command, and its text.
     stumbles: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// How many files a session has written in this run with no work laid out (u32::MAX: no longer counting).
+    unplanned: Mutex<HashMap<String, u32>>,
     /// The kinds of credential, and the credential stores, a session has already been told how to handle.
     handled: Mutex<HashMap<String, HashSet<String>>>,
     shutting_down: AtomicBool,
@@ -279,6 +281,7 @@ impl Engine {
             off_the_books: Mutex::new(HashMap::new()),
             failing: Mutex::new(HashMap::new()),
             stumbles: Mutex::new(HashMap::new()),
+            unplanned: Mutex::new(HashMap::new()),
             handled: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         })
@@ -635,6 +638,73 @@ impl Engine {
              kind lesson: what fails, what works, and why. Scope it to the project unless it holds everywhere.",
             first_line(other, 100)
         ))
+    }
+
+    /// When a session that was simply asked for something (no goal, no plan)
+    /// turns out to be building: on its third file written in one run, a line
+    /// saying to lay the work out. A request such as "build me a game" deserves
+    /// the same steps, visible in the panel and safe against interruption, as
+    /// one given as a goal; a one-file fix does not, and never sees this.
+    fn plan_reminder(&self, session: &Session, tool: &str) -> Option<String> {
+        const FILES: u32 = 3;
+        if session.parent_id.is_some() {
+            return None;
+        }
+        let mut counts = self.unplanned.lock().unwrap_or_else(|e| e.into_inner());
+        if tool.starts_with("work_") || tool == "spawn_agents" {
+            counts.insert(session.id.clone(), u32::MAX);
+            return None;
+        }
+        if !matches!(tool, "write_file" | "edit_file") {
+            return None;
+        }
+        let n = counts.entry(session.id.clone()).or_insert(0);
+        if *n == u32::MAX {
+            return None;
+        }
+        *n += 1;
+        if *n < FILES {
+            return None;
+        }
+        *n = u32::MAX;
+        drop(counts);
+        // Not if work is already laid out here and still going.
+        let view = crate::work::Overview::of(&self.store, &context::project_dir(&session.cwd)).ok()?;
+        if view.items.iter().any(|i| !i.closed()) {
+            return None;
+        }
+        Some(
+            "\n\n[narsil] This has become more than a couple of steps. Lay it out now with work_plan: one item per outcome, \
+             in the order they must happen, including what is already done. The user sees the plan and its progress in the \
+             side panel, and it is what lets the work be picked up again if this run is cut short. Then take each item with \
+             work_next as you start it and close it with work_done as it is finished."
+                .to_string(),
+        )
+    }
+
+    /// Drop what is unfinished in a directory's plan, at the user's word: the
+    /// plan is abandoned or the work has moved on, and they want the slate
+    /// clean. What was done stays on record as done. Returns the titles dropped.
+    pub fn clear_work(&self, cwd: &str) -> Result<Vec<String>> {
+        let cfg = self.cfg();
+        let project = context::project_dir(cwd);
+        crate::work::refresh(&self.store, &cfg, &self.paths);
+        let view = crate::work::Overview::of(&self.store, &project)?;
+        let open: Vec<&crate::work::Item> = view.items.iter().filter(|i| !i.closed()).collect();
+        if let Some(busy) = open.iter().find(|i| !i.claimed_by.is_empty() && self.is_running(&i.claimed_by)) {
+            bail!("{:?} is being worked on right now (session {}); interrupt it first", busy.title, busy.claimed_by);
+        }
+        let titles: Vec<String> = open.iter().map(|i| i.title.clone()).collect();
+        {
+            let graph = crate::work::Graph::open(&self.store, &cfg, &self.paths);
+            let by = crate::work::By { session: "", agent: "", message_id: 0 };
+            for title in &titles {
+                graph.update(by, &project, title, Some("dropped"), Some("cleared by the user"), &[])?;
+            }
+        }
+        self.emit_work(&project);
+        tracing::info!("cleared the work in {project}: {} unfinished item(s) dropped", titles.len());
+        Ok(titles)
     }
 
     /// When what a tool returned holds a credential, or a credential store was
@@ -1044,6 +1114,7 @@ impl Engine {
         let mut first = true;
         // What failed in an earlier turn is that turn's business.
         self.stumbles.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
+        self.unplanned.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
         loop {
             if cancel.is_cancelled() {
                 return Ok(Outcome::Interrupted);
@@ -1181,6 +1252,9 @@ impl Engine {
                 out.content.push_str(&reminder);
             }
             if let Some(reminder) = self.credential_reminder(&session, &call, &out.content) {
+                out.content.push_str(&reminder);
+            }
+            if let Some(reminder) = self.plan_reminder(&session, &call.name).filter(|_| !out.is_error) {
                 out.content.push_str(&reminder);
             }
             span.record("is_error", out.is_error).record("ok", !out.is_error).record("output_bytes", out.content.len() as u64);

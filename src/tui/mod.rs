@@ -70,6 +70,8 @@ Sessions
   /resume <id>     open a session by id    /title <text>        rename this session
   /logs [errors]   the daemon log in a window: this session's lines, following as they are written.
                    e errors, w warnings, i info, a all; s this session or all; / find text
+  /cleargoal       clear the side panel: drop what is unfinished in this directory's plan (and
+                   cancel this session's goal); what was done stays on record
   /cd <directory>  move this session to another directory: its commands, project memory and
                    work plan are then that directory's
   /continue        pick up an interrupted or paused session where it stopped
@@ -243,6 +245,8 @@ struct App {
     completing: Option<(String, usize)>,
     /// An open /trace or /stats: which, when it was last read, and whether it follows the latest steps.
     live_view: Option<(&'static str, Instant, bool)>,
+    /// Work the user cleared from the panel with /cleargoal: top-level items no longer shown here.
+    work_cleared: std::collections::HashSet<String>,
     /// The /logs window's filters, while it is open.
     logs: Option<LogView>,
     /// The Obsidian vault: None when none is set, else whether it can be reached, and when that was last checked.
@@ -628,6 +632,12 @@ pub async fn run(paths: Paths, cfg: Config, opts: Opts) -> Result<()> {
     if let Some(problem) = keys.problems.first() {
         app.flash(problem.clone());
     }
+    // An upgrade does nothing until the daemon is restarted: say so, where it will be seen.
+    if let Ok(status) = app.conn.call(Command::Status).await {
+        if let Some(warning) = crate::service::outdated(&status) {
+            app.note(warning);
+        }
+    }
     if let Some(inner) = crate::obsidian::Vault::open(&app.cfg).and_then(|v| v.vault_inside()) {
         app.note(format!(
             "obsidian: [obsidian] vault names the folder above your vault; the vault itself is {}. `narsil doctor` says more.",
@@ -700,6 +710,7 @@ impl App {
             pending_model: None,
             completing: None,
             live_view: None,
+            work_cleared: Default::default(),
             logs: None,
             vault: None,
             bg_tx,
@@ -1617,7 +1628,40 @@ impl App {
                 self.overlay = Overlay::Text { title: "help".into(), lines: HELP.lines().map(str::to_string).collect(), scroll: 0 }
             }
             "/quit" | "/exit" | "/q" => self.quit = true,
-            "/new" => {
+            "/cleargoal" => {
+                // The slate clean: what is unfinished in this directory's plan is dropped, a goal
+                // this session is working on is cancelled, and the panel forgets what it was showing.
+                if self.run_state == "running" {
+                    self.flash("it is working: esc to interrupt, then /cleargoal");
+                    return;
+                }
+                let goal = self.goal.as_ref().filter(|g| matches!(g.status.as_str(), "active" | "blocked" | "paused")).map(|g| g.id.clone());
+                if let Some(id) = goal {
+                    if let Err(e) = self.conn.call(Command::GoalAction { id, action: "cancel".into() }).await {
+                        self.error(format!("{e:#}"));
+                        return;
+                    }
+                }
+                let cwd = self.session.as_ref().map(|s| s.cwd.clone()).unwrap_or_else(|| self.cwd.clone());
+                match self.conn.call(Command::WorkClear { cwd }).await {
+                    Ok(said) => {
+                        let dropped = said["dropped"].as_array().map(|a| a.len()).unwrap_or(0);
+                        let here = crate::work::load(&self.store, Some(&self.project())).unwrap_or_default();
+                        self.work_cleared.extend(here.iter().filter(|i| i.parent.is_none()).map(|i| i.id.clone()));
+                        self.set_work(here);
+                        self.goal = None;
+                        self.milestones.clear();
+                        self.panel_focus = false;
+                        self.flash(match dropped {
+                            0 => "cleared: nothing was unfinished".to_string(),
+                            1 => "cleared: 1 unfinished item dropped; what was done stays on record".to_string(),
+                            n => format!("cleared: {n} unfinished items dropped; what was done stays on record"),
+                        });
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            "/new" | "/clear" => {
                 self.session = None;
                 self.goal = None;
                 self.work_anchors.clear();
@@ -2275,7 +2319,8 @@ impl App {
         // sessions belongs to their history, which `narsil resume` opens; it is not shown
         // here, where there would be nothing in the conversation to go to.
         let mine = |i: &WorkItem| self.work_anchors.contains_key(&i.id) || self.work.descendants(&i.id).iter().any(|d| self.work_anchors.contains_key(&d.id));
-        let shown: Vec<&WorkItem> = self.work.items.iter().filter(|i| i.parent.is_none() && (!i.closed() || mine(i))).collect();
+        let shown: Vec<&WorkItem> =
+            self.work.items.iter().filter(|i| i.parent.is_none() && (!i.closed() || mine(i)) && !self.work_cleared.contains(&i.id)).collect();
         if !shown.is_empty() {
             let leaves: Vec<&WorkItem> = shown
                 .iter()

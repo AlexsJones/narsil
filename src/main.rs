@@ -107,6 +107,9 @@ enum Cmd {
     Work {
         /// An item's title, to print that item in full
         item: Vec<String>,
+        /// Drop what is unfinished in this directory's plan (what was done stays on record)
+        #[arg(long)]
+        clear: bool,
     },
     /// Show the tree of what a session or goal did: each decision, the actions it led to, and the time they took
     Trace {
@@ -365,7 +368,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cmd_trace(&paths, id, TraceOut { timeline, flamegraph, chrome, folded, json })
         }
         Some(Cmd::Stats { since }) => cmd_stats(&paths, &since),
-        Some(Cmd::Work { item }) => cmd_work(&paths, &item.join(" ")),
+        Some(Cmd::Work { clear: true, .. }) => {
+            let conn = client::Conn::connect_or_start(&paths).await?;
+            let said = conn.call(proto::Command::WorkClear { cwd: cwd()? }).await?;
+            let dropped: Vec<String> = serde_json::from_value(said["dropped"].clone()).unwrap_or_default();
+            match dropped.len() {
+                0 => println!("nothing unfinished here"),
+                n => println!("dropped {n} unfinished item{}: {}", if n == 1 { "" } else { "s" }, dropped.join(", ")),
+            }
+            Ok(())
+        }
+        Some(Cmd::Work { item, .. }) => cmd_work(&paths, &item.join(" ")),
         Some(Cmd::Logs { follow, lines, session }) => cmd_logs(&paths, follow, lines, session),
         Some(Cmd::Service { cmd }) => match cmd {
             ServiceCmd::Install => service::install(&paths),

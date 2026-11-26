@@ -38,6 +38,22 @@ pub async fn ping(paths: &Paths) -> Option<serde_json::Value> {
     tokio::time::timeout(Duration::from_secs(3), conn.call(Command::Status)).await.ok()?.ok()
 }
 
+/// What to say if the running daemon was started before the narsil program
+/// on disk was last replaced (an upgrade, a rebuild): it is still the old
+/// version, and none of what is new is in force until it is restarted.
+/// `status` is what the daemon answered to a status request.
+pub fn outdated(status: &serde_json::Value) -> Option<String> {
+    let up = Duration::from_secs(status["uptime_secs"].as_u64()?);
+    let started = std::time::SystemTime::now().checked_sub(up)?;
+    let replaced = std::env::current_exe().ok()?.metadata().ok()?.modified().ok()?;
+    // A daemon started by this very program begins a moment after the file was written.
+    (replaced > started + Duration::from_secs(2)).then(|| {
+        "narsil has been updated since its daemon started, so the daemon is still the older version. \
+         Run `narsil restart` to use the new one: sessions and work in flight are kept."
+            .to_string()
+    })
+}
+
 fn read_pid(paths: &Paths) -> Option<i32> {
     std::fs::read_to_string(paths.pid_file()).ok()?.trim().parse().ok()
 }
@@ -136,6 +152,9 @@ pub async fn status(paths: &Paths) -> Result<()> {
         (up % 3600) / 60,
         if managed_by_systemd() { ", managed by systemd" } else { "" }
     );
+    if let Some(warning) = outdated(&st) {
+        println!("  ! {warning}");
+    }
     let model = st["model"].as_str().unwrap_or("");
     println!("  model:    {}", if model.is_empty() { "(not configured; run `narsil setup`)" } else { model });
     let running: Vec<&str> = st["running"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();

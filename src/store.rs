@@ -845,6 +845,23 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// What the user last asked of a session, in their words: the first line of it.
+    pub fn last_request(&self, session_id: &str) -> Option<String> {
+        let db = self.db();
+        let mut stmt = db
+            .prepare("SELECT blocks FROM messages WHERE session_id = ?1 AND role = 'user' AND kind = 'message' ORDER BY id DESC LIMIT 20")
+            .ok()?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0)).ok()?;
+        for blocks in rows.flatten() {
+            let parsed: Value = serde_json::from_str(&blocks).unwrap_or_default();
+            let text = parsed.as_array().and_then(|list| list.iter().find_map(|b| b.get("text").and_then(Value::as_str)));
+            if let Some(line) = text.and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty())) {
+                return Some(line.to_string());
+            }
+        }
+        None
+    }
+
     pub fn last_message(&self, session_id: &str) -> Result<Option<StoredMessage>> {
         let db = self.db();
         let m = db

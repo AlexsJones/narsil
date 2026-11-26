@@ -37,6 +37,8 @@ pub enum Command {
     SetModel { session: String, model: String },
     /// Move a session to another directory.
     SetDir { session: String, dir: String },
+    /// Drop what is unfinished in the plan of the project at this directory.
+    WorkClear { cwd: String },
     /// Every configured provider with the models it offers right now.
     Models,
     /// Change the model that new sessions (`default`) or subagents (`subagent`)

@@ -395,6 +395,10 @@ async fn handle(
             engine.switch_model(&id, model.trim())?;
             Ok(Value::Null)
         }
+        Command::WorkClear { cwd } => {
+            let dropped = engine.clear_work(&cwd)?;
+            Ok(json!({ "dropped": dropped }))
+        }
         Command::SetDir { session, dir } => {
             let id = store.resolve_session(&session)?;
             if engine.is_running(&id) {

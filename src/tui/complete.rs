@@ -27,6 +27,8 @@ pub const COMMANDS: &[Cmd] = &[
     cmd("/model", "[filter, or provider/model-id]", "choose a model"),
     cmd("/memory", "[query]", "list or search memory"),
     cmd("/new", "", "start a fresh session"),
+    cmd("/clear", "", "start a fresh session (the same as /new)"),
+    cmd("/cleargoal", "", "clear the side panel: drop unfinished work"),
     cmd("/agents", "", "list subagents"),
     cmd("/auto", "", "run tools without asking"),
     cmd("/ask", "", "ask before running tools"),
