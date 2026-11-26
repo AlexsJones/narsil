@@ -6,6 +6,12 @@
 
 <p align="center">Just enough harness. A daemon that runs your agents, and a terminal UI that attaches to it.</p>
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="narsil in a terminal: a file explorer on the left showing which files the agent has read, the conversation in the middle with the commands it is running, the objective it is working on to the right, and the colour theme picker open over them" width="920">
+</p>
+
+<p align="center"><sub>A session at work: the files it has touched on the left, what it is doing in the middle, the objective on the right. The window open over them is the theme picker.</sub></p>
+
 A model on its own forgets what it was doing when it stops, loses the thread when its context fills,
 and cannot show you what it did. narsil supplies those three things and otherwise stays out of the
 way: it works with any model, keeps what it knows in Markdown files you can open and edit, and when
