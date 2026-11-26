@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod fs;
+pub mod local;
 pub mod misc;
 pub mod shell;
 pub mod vault;
@@ -383,6 +384,28 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
             &["note", "content"],
         ));
     }
+    if local::program(cfg).is_some() {
+        v.push(spec(
+            "local_models",
+            "Ask llmfit, which knows this machine's hardware and a catalogue of open models, what can be run \
+             here and how well: whether a model fits in memory, how many tokens a second to expect, how much \
+             context it has, whether it can call tools. Use it for any question about local or open-source \
+             models on this machine (which is best for some purpose, whether one will run, what one needs) \
+             instead of answering from general knowledge, which does not know this machine. `recommend` with \
+             purpose `agentic` gives the models able to drive an agent such as this one: they call tools, and \
+             they are sized for the context an agent needs. `hardware` describes the machine; `plan` says how a \
+             named model would run here, at a quantisation of your choosing, and what it needs; `info` looks a model up.",
+            json!({
+                "action": { "type": "string", "enum": ["recommend", "hardware", "plan", "info"] },
+                "purpose": { "type": "string", "enum": ["agentic", "coding", "reasoning", "chat", "general", "multimodal", "embedding"], "description": "With recommend: what the model is for. Default agentic." },
+                "limit": { "type": "integer", "description": "With recommend: how many to return. Default 5." },
+                "context": { "type": "integer", "description": "The context, in tokens, to size memory for. Default 32768 for agentic work." },
+                "model": { "type": "string", "description": "With plan and info: the model's name, as recommend gives it." },
+                "quant": { "type": "string", "description": "With plan: the quantisation to plan for, such as Q4_K_M. Default: the one llmfit picks." }
+            }),
+            &["action"],
+        ));
+    }
     if session.depth < cfg.agents.max_depth {
         v.push(spec(
             "spawn_agents",
@@ -586,6 +609,7 @@ pub async fn execute(ctx: &ToolCtx<'_>) -> ToolOutput {
         "glob" => fs::glob(ctx).await,
         "grep" => fs::grep(ctx).await,
         "web_fetch" => misc::web_fetch(ctx).await,
+        "local_models" => local::local_models(ctx).await,
         "memory_save" => misc::memory_save(ctx),
         "memory_search" => misc::memory_search(ctx),
         "memory_forget" => misc::memory_forget(ctx),

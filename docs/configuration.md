@@ -57,4 +57,5 @@ provider never saw a particular credential, keep it somewhere the agent has no r
 `mask_secrets = false` under `[permissions]` turns the masking off.
 
 Also configured in `config.toml`: [the Obsidian vault](obsidian.md), [key bindings](tui.md),
-[what is logged](observability.md), and [limits on goals](continuity.md#goals).
+[what is logged](observability.md), [limits on goals](continuity.md#goals), and
+[llmfit, for questions about local models](local-models.md).

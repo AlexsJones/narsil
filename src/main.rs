@@ -1029,6 +1029,14 @@ async fn cmd_doctor(paths: &Paths) -> Result<()> {
         for (what, path) in telemetry::locations(paths) {
             println!("            {what}: {}", path.display());
         }
+        println!(
+            "llmfit      {}",
+            match (cfg.llmfit.command.trim().is_empty(), tools::local::program(&cfg)) {
+                (true, _) => "switched off ([llmfit] command is empty)".to_string(),
+                (false, Some(found)) => format!("{} (the agent can ask it which local models this machine runs)", found.display()),
+                (false, None) => "not installed (`brew install llmfit`): the agent cannot say which local models fit this machine".to_string(),
+            }
+        );
         let vault = cfg.obsidian.vault.trim();
         println!(
             "obsidian    {}",

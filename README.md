@@ -79,6 +79,7 @@ narsil goal add "get the test suite passing"   # unattended work
 | [Memory](docs/memory.md) | What is remembered, when it is written, when it comes back |
 | [Context cohesion](docs/context.md) | What is in front of the agent at each step, and what is kept out |
 | [Obsidian](docs/obsidian.md) | Your vault as the first place to look; closing parts of it |
+| [Local models](docs/local-models.md) | Which open models your machine can run an agent on, asked of llmfit |
 | [Observability](docs/observability.md) | Traces, logs, status and totals |
 | [The terminal UI](docs/tui.md) | Tabs, keys, commands, the side panel |
 | [Development](docs/development.md) | Tests, and how a release is made |

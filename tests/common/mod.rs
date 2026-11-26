@@ -115,6 +115,8 @@ impl Narsil {
         let mut config = Config { text: std::fs::read_to_string(&path).unwrap() };
         // Notes changed by hand are noticed within a second, not twenty.
         config.set("memory", "rescan_secs", "1");
+        // The same on every machine, whether or not llmfit is installed on it.
+        config.set("llmfit", "command", "\"\"");
         adjust(&narsil.base, &mut config);
         std::fs::write(&path, config.text).unwrap();
         narsil
@@ -421,7 +423,7 @@ fn block_text(blocks: &str) -> String {
 
 /// `config.toml` as text, for a test to change a setting in.
 pub struct Config {
-    text: String,
+    pub text: String,
 }
 
 impl Config {

@@ -115,6 +115,25 @@ pub struct Config {
     pub memory: MemoryConfig,
     pub telemetry: TelemetryConfig,
     pub keys: KeysConfig,
+    pub llmfit: LlmfitConfig,
+}
+
+/// llmfit (https://github.com/AlexsJones/llmfit) knows which local models
+/// this machine can run. When it is installed the agent can ask it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct LlmfitConfig {
+    /// The llmfit program: a name to find on the PATH, or a path. Empty: do not use it.
+    pub command: String,
+    /// Recommend only what these can serve: "llama.cpp", "Ollama", "LM Studio",
+    /// "MLX". Empty: whichever of them are installed.
+    pub runtimes: Vec<String>,
+}
+
+impl Default for LlmfitConfig {
+    fn default() -> Self {
+        LlmfitConfig { command: "llmfit".into(), runtimes: Vec::new() }
+    }
 }
 
 /// Key bindings in the TUI. A binding is modifiers and a key joined by `+`
@@ -780,6 +799,15 @@ pub fn render_config(c: &Config) -> String {
     s.push_str("# Every session run, model call and tool call is recorded with its timing; `narsil trace`\n");
     s.push_str("# and `narsil stats` read that. Days to keep it.\n");
     s.push_str(&format!("keep_days = {}\n\n", c.telemetry.keep_days));
+
+    s.push_str("[llmfit]\n");
+    s.push_str("# llmfit knows which local models this machine can run (brew install llmfit). When it is\n");
+    s.push_str("# installed the agent can ask it: \"what is the best local model for agent work on this machine?\"\n");
+    s.push_str("# The program's name or path; empty to leave it out.\n");
+    s.push_str(&format!("command = {}\n", q(&c.llmfit.command)));
+    s.push_str("# Recommend only what these can serve: \"llama.cpp\", \"Ollama\", \"LM Studio\", \"MLX\".\n");
+    s.push_str("# Empty: whichever of them are installed.\n");
+    s.push_str(&format!("runtimes = [{}]\n\n", c.llmfit.runtimes.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")));
 
     s.push_str("[keys]\n");
     s.push_str("# Key bindings in the TUI. A binding is modifiers (ctrl, alt, shift) and a key joined by +,\n");

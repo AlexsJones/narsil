@@ -8,6 +8,7 @@
 //!   !bash <command>        call the bash tool
 //!   !tool <name> <json>    call any tool
 //!   !say <text>            reply with text and end the turn
+//!   !tools                 reply with the names of the tools on offer
 //! The script is the last user text containing a line that starts with `!`,
 //! up to the first blank line. Without a script the mock echoes the user.
 
@@ -73,6 +74,7 @@ impl Client {
         } else if let Some((at, steps)) = script {
             let done = req.messages[at + 1..].iter().filter(|m| m.role == Role::Assistant).count();
             match steps.get(done).map(String::as_str) {
+                Some("!tools") => say = req.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(" "),
                 Some(step) if step.starts_with("!bash") => {
                     let command = step["!bash".len()..].trim().to_string();
                     say = String::new();

@@ -2,7 +2,8 @@
 //! model in the loop. Those check what narsil does with what a model tells
 //! it; these check that a model, given narsil's prompt and tools, tells it:
 //! that it writes down a dead end, uses a lesson, files work where the work
-//! is, and looks in the vault before guessing.
+//! is, looks in the vault before guessing, and asks llmfit what this machine
+//! can run.
 //!
 //! They cost money and depend on the model, so they run only when asked for:
 //!
@@ -181,4 +182,36 @@ fn asked_about_the_user_it_looks_in_the_vault_and_keeps_out_of_what_is_closed() 
     println!("pushed at a closed note: {}\n  said: {}", tools(&pushed), pushed.said.trim());
     assert!(!pushed.everything().contains("61234"), "a closed note reached the model");
     assert!(!pushed.said.contains("61234"));
+}
+
+#[test]
+#[ignore = "calls a real model"]
+fn asked_which_local_model_suits_agent_work_it_asks_llmfit_and_answers_from_what_it_says() {
+    // This one needs the real llmfit as well as a real model.
+    let installed = std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("llmfit").is_file()));
+    if !installed {
+        println!("INCONCLUSIVE: llmfit is not installed here, so there is nothing for the model to ask.");
+        return;
+    }
+    let narsil = Narsil::live(|_, config| config.set("llmfit", "command", "\"llmfit\""));
+    let dir = narsil.dir("chat");
+
+    let asked = narsil.ask(&dir, "tell me the best local model for agentic workflows on my machine");
+    println!("asked for a local model: {}\n  said: {}", tools(&asked), asked.said.trim());
+    let answers: Vec<_> = asked.calls_to("local_models").into_iter().filter(|c| !c.failed).collect();
+    assert!(!answers.is_empty(), "it answered without asking llmfit what this machine can run");
+    assert!(answers.iter().any(|c| c.input.contains("recommend")), "it did not ask for a recommendation: {answers:?}");
+    assert!(!asked.calls().iter().any(|c| c.name == "web_fetch"), "it went to the web for what llmfit knows");
+
+    // What it recommends is something llmfit put forward, not a model from general knowledge.
+    let put_forward: Vec<String> = answers
+        .iter()
+        .flat_map(|c| c.result.lines())
+        .filter_map(|line| line.trim_start().split_once(". ").filter(|(rank, _)| rank.parse::<u32>().is_ok()).map(|(_, rest)| rest))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(|name| name.split('/').next_back().unwrap_or(name).to_lowercase())
+        .collect();
+    assert!(!put_forward.is_empty(), "llmfit put nothing forward: {answers:?}");
+    let said = asked.said.to_lowercase();
+    assert!(put_forward.iter().any(|name| said.contains(name)), "it named none of what llmfit put forward ({put_forward:?}): {}", asked.said);
 }

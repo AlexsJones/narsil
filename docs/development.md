@@ -45,6 +45,10 @@ Source layout: `engine.rs` (the loop), `store.rs` (the database), `memory.rs` (t
 `tools/` (what the model can call), `tui/` (the interface), `setup.rs`, `service.rs`, `voice.rs`.
 `tests/` holds the scenarios and the live tests.
 
+`tests/local.rs` checks what narsil asks of llmfit, with a script standing in for it. A test instance
+has no llmfit unless the test gives it one, so the suite is the same on a machine with llmfit
+installed and on one without.
+
 ## Releasing
 
 The git tag is the version. Pushing one releases it:
