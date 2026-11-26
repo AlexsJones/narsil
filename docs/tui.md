@@ -50,6 +50,9 @@ as is a key bound to two actions. The keys window (`f1`, or `/keys`) always show
 Going to a tab by number takes two keystrokes because terminals keep the one-stroke versions for
 themselves: Ptyxis, GNOME Terminal and Ghostty all use alt+1…9 for their own tabs.
 
+The two panels share the window with the conversation: both show side by side from 80 columns up,
+taking more as the window widens. In a narrower window the one you asked for last stays.
+
 ## Tabs
 
 Each tab is a session of its own with its own connection to the daemon, and they all work at once.

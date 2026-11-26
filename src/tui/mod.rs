@@ -166,6 +166,37 @@ impl LogView {
     }
 }
 
+/// How a window's width is shared between the explorer on the left and the
+/// objectives panel on the right, each wanted or not: the width of each (0:
+/// not shown). Both are shown whenever the conversation between them can
+/// keep `MAIN` columns, which holds from an 80-column window up; they take
+/// more as the window widens, up to a limit. In a window too narrow for both,
+/// the one asked for last stays.
+fn side_widths(total: u16, files: bool, panel: bool, files_last: bool) -> (u16, u16) {
+    const MAIN: u16 = 34;
+    const FILES: (u16, u16) = (20, 38);
+    const PANEL: (u16, u16) = (24, 46);
+    let spare = total.saturating_sub(MAIN);
+    let alone = |share: u16, (least, most): (u16, u16)| if spare >= least { share.clamp(least, most).min(spare) } else { 0 };
+    match (files, panel) {
+        (false, false) => (0, 0),
+        (true, false) => (alone(total / 4, FILES), 0),
+        (false, true) => (0, alone(total / 3, PANEL)),
+        (true, true) if spare >= FILES.0 + PANEL.0 => {
+            let mut f = (total as u32 * 26 / 100).clamp(FILES.0 as u32, FILES.1 as u32) as u16;
+            let mut p = (total as u32 * 30 / 100).clamp(PANEL.0 as u32, PANEL.1 as u32) as u16;
+            // Give back to the conversation what it is short of: the panel first, then the explorer.
+            let over = (f + p).saturating_sub(spare);
+            let from_panel = over.min(p - PANEL.0);
+            p -= from_panel;
+            f -= (over - from_panel).min(f - FILES.0);
+            (f, p)
+        }
+        (true, true) if files_last => (alone(total / 4, FILES), 0),
+        (true, true) => (0, alone(total / 3, PANEL)),
+    }
+}
+
 /// One row of the side panel.
 struct Nav {
     text: String,
@@ -265,6 +296,9 @@ struct App {
     files_read: Option<Instant>,
     files_scanned: Option<Instant>,
     files_on_disk: std::collections::HashSet<std::path::PathBuf>,
+    /// Of the two side panels, the explorer was the one asked for last: it is the one that
+    /// stays if the window is too narrow for both.
+    files_last: bool,
     /// The directory the explorer last showed, to notice a move at once.
     files_root: String,
     /// The request cleared from the panel with /cleargoal: the message it was, so a later one shows again.
@@ -808,6 +842,7 @@ impl App {
             files_read: None,
             files_scanned: None,
             files_on_disk: Default::default(),
+            files_last: false,
             files_root: String::new(),
             objective_cleared: None,
             work_cleared: Default::default(),
@@ -1391,7 +1426,9 @@ impl App {
         // Out, or in but not held: bring it in and take the keyboard to it.
         self.panel_hidden = false;
         self.files_focus = false;
+        self.files_last = false;
         self.focus_panel();
+        self.say_if_crowded();
         self.dirty = true;
     }
 
@@ -1464,6 +1501,7 @@ impl App {
             (false, _) => {
                 self.files_visible = true;
                 self.files_focus = true;
+                self.files_last = true;
                 self.panel_focus = false;
                 self.refresh_files(true);
                 // Start where the work is: the file being worked on, else the last one touched here.
@@ -1474,6 +1512,7 @@ impl App {
             }
             (true, false) => {
                 self.files_focus = true;
+                self.files_last = true;
                 self.panel_focus = false;
             }
             (true, true) => {
@@ -1481,6 +1520,7 @@ impl App {
                 self.files_focus = false;
             }
         }
+        self.say_if_crowded();
         self.dirty = true;
     }
 
@@ -1582,14 +1622,33 @@ impl App {
         self.dirty = true;
     }
 
-    /// How wide the explorer is, given the width of the window: nothing if it is hidden or there is no room.
-    fn files_width(&self, total: u16) -> u16 {
-        if !self.files_visible || total < 72 { 0 } else { (total / 4).clamp(26, 40) }
+    /// The widths of the explorer and of the objectives panel in a window this wide.
+    fn sides(&self, total: u16) -> (u16, u16) {
+        let panel = !self.panel_hidden && !self.nav().is_empty();
+        side_widths(total, self.files_visible, panel, self.files_last)
+    }
+
+    /// After one of the two panels is asked for: say so if the window is too narrow for both,
+    /// since the other has just given way to it.
+    fn say_if_crowded(&mut self) {
+        let panel = !self.panel_hidden && !self.nav().is_empty();
+        if self.files_visible && panel {
+            let (files, objectives) = self.sides(self.last_width);
+            if files == 0 || objectives == 0 {
+                self.flash("too narrow for both panels: 80 columns shows them side by side");
+            }
+        }
     }
 
     fn draw_files(&mut self, f: &mut Frame, area: Rect) {
         let focus = self.files_focus;
-        let hint = if focus { " ↑↓ · enter open, go to · esc " } else { " + new  ~ changed  ○ read  ▶ now " };
+        let hint = match (focus, area.width) {
+            (true, w) if w >= 34 => " ↑↓ · enter open, go to · esc ",
+            (true, _) => " ↑↓ enter esc ",
+            (false, w) if w >= 36 => " + new  ~ changed  ○ read  ▶ now ",
+            (false, w) if w >= 24 => " +new ~chg ○read ▶now ",
+            (false, _) => "",
+        };
         let block = UiBlock::bordered()
             .border_style(Style::new().fg(if focus { Color::LightBlue } else { Color::DarkGray }))
             .title(" files ")
@@ -2887,10 +2946,6 @@ impl App {
         self.nav().into_iter().filter_map(|n| n.anchor).collect()
     }
 
-    fn panel_width(&self, total: u16) -> u16 {
-        if self.panel_hidden || total < 84 || self.nav().is_empty() { 0 } else { (total / 3).clamp(30, 46) }
-    }
-
     /// Move the keyboard to the panel, starting on the objective in progress.
     fn focus_panel(&mut self) {
         let rows: Vec<Nav> = self.nav().into_iter().filter(|n| n.anchor.is_some()).collect();
@@ -3031,7 +3086,7 @@ impl App {
         .areas(area);
         self.draw_header(f, header);
         // The explorer on the left, when it is shown and there is room for it.
-        let files_w = self.files_width(area.width);
+        let (files_w, panel_w) = self.sides(area.width);
         let body = if files_w > 0 {
             let [left, rest] = Layout::horizontal([Constraint::Length(files_w), Constraint::Min(40)]).areas(body);
             self.draw_files(f, left);
@@ -3040,7 +3095,6 @@ impl App {
             self.files_focus = false;
             body
         };
-        let panel_w = self.panel_width(area.width.saturating_sub(files_w));
         self.panel_visible = panel_w > 0;
         if !self.panel_visible {
             self.panel_focus = false;
@@ -3453,5 +3507,37 @@ impl App {
             .collect();
         f.render_widget(Clear, rect);
         f.render_widget(Paragraph::new(shown).block(block), rect);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::side_widths;
+
+    #[test]
+    fn both_side_panels_fit_from_an_ordinary_window_up() {
+        // (window, explorer, objectives): both are there, and the conversation keeps room to be read.
+        for total in [80u16, 91, 100, 120, 160, 240] {
+            let (files, panel) = side_widths(total, true, true, false);
+            assert!(files >= 20 && panel >= 24, "at {total} columns: explorer {files}, objectives {panel}");
+            assert!(total - files - panel >= 34, "at {total} columns the conversation is left {}", total - files - panel);
+            assert!(files <= 38 && panel <= 46, "at {total} columns the panels have taken too much: {files}, {panel}");
+        }
+        // The window this was reported in: 91 columns.
+        assert_eq!(side_widths(91, true, true, false), (23, 27));
+        assert_eq!(side_widths(80, true, true, true), (20, 24), "and the classic 80");
+
+        // One alone takes a little more, and still leaves the conversation its room.
+        assert_eq!(side_widths(91, true, false, false), (22, 0));
+        assert_eq!(side_widths(91, false, true, false), (0, 30));
+        assert_eq!(side_widths(200, true, false, false), (38, 0));
+        assert_eq!(side_widths(200, false, true, false), (0, 46));
+        assert_eq!(side_widths(91, false, false, true), (0, 0));
+
+        // Too narrow for both: the one asked for last stays. Too narrow for either: the conversation has it all.
+        assert_eq!(side_widths(70, true, true, true), (20, 0));
+        assert_eq!(side_widths(70, true, true, false), (0, 24));
+        assert_eq!(side_widths(50, true, true, true), (0, 0));
+        assert_eq!(side_widths(50, false, true, false), (0, 0));
     }
 }
