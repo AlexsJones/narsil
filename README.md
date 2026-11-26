@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/logo.png" alt="narsil" width="64">
-</p>
-
 <h1 align="center">narsil</h1>
 
 <p align="center">Just enough harness. A daemon that runs your agents, and a terminal UI that attaches to it.</p>
@@ -90,3 +86,7 @@ narsil goal add "get the test suite passing"   # unattended work
 Early software, built and tested on Linux. macOS builds are released but have had little use.
 
 [MIT](LICENSE) licensed.
+
+<p align="center">
+  <img src="assets/logo.png" alt="narsil" width="36">
+</p>
