@@ -72,7 +72,8 @@ Sessions
   /new             start a fresh session   /sessions            pick a session to resume
   /resume <id>     open a session by id    /title <text>        rename this session
   /logs [errors]   the daemon log in a window: this session's lines, following as they are written.
-                   e errors, w warnings, i info, a all; s this session or all; / find text
+                   e errors, w warnings, i info, a all; s this session or all; / find text;
+                   l wraps long lines or cuts them off
   /daemonrestart   stop and start the daemon (after an update, say) and reconnect every tab
   /files           the file explorer on the left (shift+tab): the folder this session works in, with what
                    narsil made (+), changed (~), read (○) and is on now (▶); elsewhere, in grey
@@ -145,6 +146,8 @@ struct LogView {
     find: String,
     /// The text to find is being typed.
     typing: bool,
+    /// Long lines run on to the next line, in full, instead of being cut off at the edge.
+    wrap: bool,
 }
 
 impl LogView {
@@ -159,7 +162,7 @@ impl LogView {
             (false, false) => format!(" · find: {}", self.find),
             _ => String::new(),
         };
-        format!("logs · {whose} · {level}{find}")
+        format!("logs · {whose} · {level}{find}{}", if self.wrap { "" } else { " · long lines cut" })
     }
 }
 
@@ -264,6 +267,8 @@ struct App {
     files_on_disk: std::collections::HashSet<std::path::PathBuf>,
     /// The directory the explorer last showed, to notice a move at once.
     files_root: String,
+    /// The request cleared from the panel with /cleargoal: the message it was, so a later one shows again.
+    objective_cleared: Option<i64>,
     /// Work the user cleared from the panel with /cleargoal: top-level items no longer shown here.
     work_cleared: std::collections::HashSet<String>,
     /// The /logs window's filters, while it is open.
@@ -804,6 +809,7 @@ impl App {
             files_scanned: None,
             files_on_disk: Default::default(),
             files_root: String::new(),
+            objective_cleared: None,
             work_cleared: Default::default(),
             logs: None,
             vault: None,
@@ -1740,6 +1746,18 @@ impl App {
             .unwrap_or_default();
         let root = self.session.as_ref().map(|s| s.root_id.as_str()).filter(|_| view.mine);
         let mut lines = crate::telemetry::log_view(&text, view.min, root, &view.find);
+        if view.wrap {
+            // The whole of each line, run on under itself, set in so that the times still line up down the edge.
+            let room = (self.last_width.saturating_sub(6).clamp(20, 400) as usize).saturating_sub(4).max(30);
+            lines = lines
+                .iter()
+                .flat_map(|line| {
+                    let mut pieces = wrap(line, room.saturating_sub(4)).into_iter();
+                    let first = pieces.next().unwrap_or_default();
+                    std::iter::once(first).chain(pieces.map(|rest| format!("    {rest}"))).collect::<Vec<_>>()
+                })
+                .collect();
+        }
         if lines.is_empty() {
             lines.push(if text.is_empty() {
                 format!("There is no log yet at {}.", file.display())
@@ -1786,6 +1804,7 @@ impl App {
             KeyCode::Char('s') => view.mine = !view.mine,
             KeyCode::Char('/') => view.typing = true,
             KeyCode::Char('c') => view.find.clear(),
+            KeyCode::Char('l') => view.wrap = !view.wrap,
             KeyCode::Char('f') => {
                 // Back to the end, and keep up with it.
                 self.relog();
@@ -1942,6 +1961,12 @@ impl App {
         if text.starts_with('/') {
             self.command(text.trim()).await;
         } else {
+            // A new thing asked for clears away what was finished before it: plans that are
+            // done leave the panel (they stay on record), and this becomes the objective.
+            if self.run_state != "running" {
+                let finished: Vec<String> = self.work.items.iter().filter(|i| i.parent.is_none() && i.closed()).map(|i| i.id.clone()).collect();
+                self.work_cleared.extend(finished);
+            }
             self.send(text).await;
         }
     }
@@ -2031,6 +2056,7 @@ impl App {
                         self.work_cleared.extend(here.iter().filter(|i| i.parent.is_none()).map(|i| i.id.clone()));
                         self.set_work(here);
                         self.goal = None;
+                        self.objective_cleared = self.objective().map(|(_, msg, _)| msg);
                         self.milestones.clear();
                         self.panel_focus = false;
                         self.flash(match dropped {
@@ -2247,7 +2273,7 @@ impl App {
                     "warnings" | "warn" | "w" => 2,
                     _ => 0,
                 };
-                self.logs = Some(LogView { min, mine: self.session.is_some(), find: String::new(), typing: false });
+                self.logs = Some(LogView { min, mine: self.session.is_some(), find: String::new(), typing: false, wrap: true });
                 self.relog();
             }
             "/trace" | "/stats" => {
@@ -2673,12 +2699,14 @@ impl App {
                 detail.push(format!("from another session: narsil resume {owner}"));
             }
         }
+        // Done is ticked in green and struck through, as on a list being worked down.
+        let text_style = if item.status == "done" { dim.add_modifier(Modifier::CROSSED_OUT) } else { style };
         let mut nav = Nav {
             text,
             detail: detail.join("\n"),
             mark,
             mark_style: style,
-            style,
+            style: text_style,
             // i64::MAX is past every message: selecting such a row moves nothing.
             anchor: Some(here.unwrap_or(i64::MAX)),
             indent: depth * 2,
@@ -2703,6 +2731,46 @@ impl App {
     /// The rows of the side panel: the goal, the work graph with the subagents
     /// holding each item beneath it, subagents that hold no item, and recorded
     /// milestones.
+    /// What was last asked of this session, once narsil has started doing something about
+    /// it: the text, the message it was, and how it stands ("working", "done", "interrupted").
+    /// A goal has its own place in the panel, and a question that was simply answered is not
+    /// an objective.
+    fn objective(&self) -> Option<(String, i64, &'static str)> {
+        let session = self.session.as_ref()?;
+        if self.goal.is_some() || session.parent_id.is_some() {
+            return None;
+        }
+        // The last thing asked that narsil acted on. A question asked since, and simply
+        // answered, sets no new objective and leaves this one standing.
+        let mut later = self.entries.len();
+        let mut found = None;
+        for at in (0..self.entries.len()).rev() {
+            if !matches!(self.entries[at].item, Item::User { .. }) {
+                continue;
+            }
+            if self.entries[at + 1..later].iter().any(|e| matches!(e.item, Item::Tool { .. })) {
+                found = Some((at, later == self.entries.len() || !self.entries[later..].iter().any(|e| matches!(e.item, Item::Tool { .. }))));
+                break;
+            }
+            later = at;
+        }
+        let (at, _) = found?;
+        let Item::User { text } = &self.entries[at].item else { return None };
+        let asked = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+        let msg = self.entries[at].msg_id;
+        if self.objective_cleared == Some(msg) {
+            return None;
+        }
+        // It is the one being worked on only if nothing has been asked after it.
+        let latest = !self.entries[at + 1..].iter().any(|e| matches!(e.item, Item::User { .. }));
+        let state = match (self.run_state.as_str(), latest) {
+            ("running", true) => "working",
+            ("interrupted", true) => "interrupted",
+            _ => "done",
+        };
+        Some((asked.to_string(), msg, state))
+    }
+
     fn nav(&self) -> Vec<Nav> {
         let heading_style = Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD);
         let dim = Style::new().fg(Color::DarkGray);
@@ -2732,7 +2800,31 @@ impl App {
         let mut rows = Vec::new();
         if let Some(g) = &self.goal {
             rows.push(heading(format!("GOAL · {} · turn {}", g.status, g.iterations)));
-            rows.push(row(g.objective.trim().to_string(), "◆", Style::new(), 0));
+            // Struck through once it is achieved.
+            let (mark, style) = if g.status == "completed" { ("✓", dim.add_modifier(Modifier::CROSSED_OUT)) } else { ("◆", Style::new()) };
+            let mut goal = row(g.objective.trim().to_string(), mark, style, 0);
+            if g.status == "completed" {
+                goal.mark_style = Style::new().fg(Color::Green);
+            }
+            rows.push(goal);
+        }
+        // What was asked for in passing is the objective until the next thing is asked: shown while
+        // it is worked on, struck through when it is done. A plan laid out under it says the same
+        // with its steps, so then the plan stands for it.
+        if let Some((asked, msg, state)) = self.objective() {
+            let planned = self.work.items.iter().any(|i| i.parent.is_none() && i.title == first_line(&asked, 70) && !self.work_cleared.contains(&i.id));
+            if !planned {
+                rows.push(heading(format!("OBJECTIVE · {state}")));
+                let (mark, mark_style, style) = match state {
+                    "done" => ("✓", Style::new().fg(Color::Green), dim.add_modifier(Modifier::CROSSED_OUT)),
+                    "working" => ("▶", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD), Style::new().add_modifier(Modifier::BOLD)),
+                    _ => ("⏸", Style::new().fg(Color::Magenta), Style::new()),
+                };
+                let mut objective = row(asked, mark, style, msg);
+                objective.mark_style = mark_style;
+                objective.rank = if state == "working" { 2 } else { 0 };
+                rows.push(objective);
+            }
         }
         // The work graph, top-level items with their parts beneath: what is unfinished in
         // this directory, and what this session itself worked on. Work finished in earlier
@@ -2854,7 +2946,13 @@ impl App {
             (true, true) => " ↑↓ jump · enter open · esc live ",
             (true, false) => " ↑↓ jump · esc live ",
         };
-        let title = if self.work.items.is_empty() && self.goal.is_none() { " agents " } else { " work " };
+        let title = if self.goal.is_some() || self.objective().is_some() {
+            " objectives "
+        } else if self.work.items.is_empty() {
+            " agents "
+        } else {
+            " work "
+        };
         let block = UiBlock::bordered()
             .border_style(Style::new().fg(if focus { Color::LightBlue } else { Color::DarkGray }))
             .title(title)
@@ -3284,7 +3382,7 @@ impl App {
                 title.clone(),
                 lines.clone(),
                 None,
-                "e errors · w warnings · i info · a all · s this session/all · / find · c clear · f follow · esc close",
+                "e errors · w warnings · i info · a all · s this session/all · / find · c clear · l wrap · f follow · esc",
             ),
             Overlay::Text { title, lines, .. } if matches!(self.file_view, Some(Some(_))) => {
                 (title.clone(), lines.clone(), None, "↑↓ scroll · enter go to it in the conversation · esc close")
@@ -3326,7 +3424,11 @@ impl App {
                     Line::styled(format!(" {text:<w$}", w = inner.width.saturating_sub(1) as usize), Style::new().bg(Color::LightBlue).fg(Color::Black))
                 } else if logs {
                     // By how serious the line is; a line that continues another keeps its colour.
-                    let level = lines[..=i].iter().rev().find_map(|l| ["ERROR", " WARN", "DEBUG", " INFO"].iter().position(|lv| l.get(12..18).is_some_and(|at| at.contains(lv))));
+                    let level = lines[..=i]
+                        .iter()
+                        .rev()
+                        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+                        .find_map(|l| ["ERROR", " WARN", "DEBUG", " INFO"].iter().position(|lv| l.get(12..18).is_some_and(|at| at.contains(lv))));
                     let style = match level {
                         Some(0) => Style::new().fg(Color::Red),
                         Some(1) => Style::new().fg(Color::Yellow),

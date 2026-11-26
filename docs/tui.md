@@ -59,10 +59,17 @@ session; `narsil resume <id>` (printed for every tab when you leave) reopens one
 
 ## The goal and work panel
 
-On the right. It appears when there is a goal, unfinished work in this directory, or subagents, and
-`tab` pops it out and back in. It shows the goal (or, for something asked in passing that turned
-into building, the request), the work graph (✓ done, ▶ in progress, ○ ready, · blocked, ? waiting on
-you) with the subagents holding each item, and recorded milestones.
+On the right. It appears when there is something to show, and `tab` pops it out and back in.
+
+- **The objective.** A goal, with its status and turn. Or, with no goal set, the last thing you asked
+  for that narsil acted on: `▶` while it works on it, ticked and struck through when it is done,
+  and replaced when you ask for the next thing. A question that is simply answered sets no objective
+  and leaves the last one standing.
+- **The work**, when it has been laid out as a plan: the graph of items (✓ done and struck through,
+  ▶ in progress, ○ ready, · blocked, ? waiting on you) with the subagents holding each one. A plan
+  made for something asked in passing hangs under the request, and then stands for it. Plans that
+  are finished leave the panel when you ask for the next thing; they stay on record.
+- **Subagents** holding no item, and recorded milestones.
 
 With the keyboard in it, up and down move through the items and the conversation follows, jumping to
 where each was last touched; enter opens a subagent; esc returns to the end of the conversation. A

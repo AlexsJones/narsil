@@ -68,6 +68,7 @@ in the middle of, and `narsil stats` has a line per session beside the totals.
 In the TUI, `/logs` opens the log in a window: this session's lines, with its subagents', following
 as they are written. `e` shows errors only, `w` warnings and errors, `i` info and up, `a` everything;
 `s` switches between this session and all of them; `/` finds text; `f` goes back to following.
+Long lines are wrapped in full; `l` cuts them off at the edge instead, one line each.
 `/logs errors` opens straight on the errors.
 
 The log is leveled:
