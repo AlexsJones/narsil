@@ -223,8 +223,12 @@ pub async fn update(paths: &Paths, opts: Opts) -> Result<()> {
         return Ok(());
     }
 
+    // Already the latest release: there is nothing to fetch. (A checkout is rebuilt as it stands,
+    // since it may hold work that no release has yet.)
+    let current_is_latest = latest.as_ref().is_some_and(|latest| !newer(latest, current));
     let mut changed = true;
     match &install {
+        Install::Brew { .. } | Install::Cargo { source: Source::Git(_), .. } if current_is_latest => changed = false,
         Install::Brew { prefix } => {
             let brew = prefix.join("bin/brew");
             let brew = if brew.exists() { brew } else { PathBuf::from("brew") };
