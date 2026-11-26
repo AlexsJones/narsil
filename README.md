@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.jpg" alt="narsil" width="96">
+  <img src="assets/logo.png" alt="narsil" width="64">
 </p>
 
 <h1 align="center">narsil</h1>
