@@ -509,8 +509,17 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_model(&self, id: &str, model: &str) -> Result<()> {
-        self.db().execute("UPDATE sessions SET model = ?2 WHERE id = ?1", params![id, model])?;
+    /// Hand the session to another model. The system prompt is cleared so the
+    /// next call builds a fresh one (it names the model), and reasoning blocks
+    /// written so far are no longer replayed: they belong to the model that
+    /// wrote them. Neither costs anything, since prompt caches are per model.
+    pub fn switch_model(&self, id: &str, model: &str) -> Result<()> {
+        self.db().execute(
+            "UPDATE sessions SET model = ?2, system_prompt = '', \
+             strip_thinking_before = (SELECT COALESCE(MAX(m.id), 0) + 1 FROM messages m WHERE m.session_id = ?1) \
+             WHERE id = ?1",
+            params![id, model],
+        )?;
         Ok(())
     }
 
@@ -1174,6 +1183,22 @@ mod tests {
         assert_eq!(store.memory_list(&[], 10).unwrap().len(), 2);
         assert!(store.memory_delete(a).unwrap());
         assert!(store.memory_search("helix", &[g], 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn switching_model_refreshes_the_prompt_and_retires_old_reasoning() {
+        let store = Store::open_memory().unwrap();
+        let s = session(&store);
+        store.set_system_prompt(&s.id, "You are model A").unwrap();
+        let other = session(&store);
+        let last = store.append_message(&s.id, Role::User, MsgKind::Message, &[Block::Text { text: "hi".into() }]).unwrap();
+        store.append_message(&other.id, Role::User, MsgKind::Message, &[Block::Text { text: "elsewhere".into() }]).unwrap();
+        store.switch_model(&s.id, "mock/b").unwrap();
+        let after = store.require_session(&s.id).unwrap();
+        assert_eq!(after.model, "mock/b");
+        assert!(after.system_prompt.is_empty(), "rebuilt on the next call");
+        assert_eq!(after.strip_thinking_before, last.id + 1, "only this session's messages count");
+        assert_eq!(store.require_session(&other.id).unwrap().model, "mock/m");
     }
 
     #[test]

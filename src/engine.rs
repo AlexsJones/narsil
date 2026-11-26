@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, Paths, split_model_ref};
 use crate::context;
 use crate::logln;
-use crate::proto::{ApprovalInfo, Envelope, Event};
+use crate::proto::{ApprovalInfo, Envelope, Event, ProviderModels};
 use crate::provider::{self, ChatRequest, Provider, ProviderError, StopReason, StreamEvent};
 use crate::store::{AgentInfo, NewSession, Session, Store, ToolCall};
 use crate::tools::{self, ToolCtx};
@@ -213,6 +213,76 @@ impl Engine {
             bail!("unknown provider {p:?} in model {model:?}; configured providers: {}", known.join(", "));
         }
         Ok(())
+    }
+
+    /// Ask every configured provider for its models, all at once. A provider
+    /// that cannot answer is still listed, with the reason.
+    pub async fn list_models(&self) -> Vec<ProviderModels> {
+        let cfg = self.cfg();
+        let lookups = cfg.providers.iter().map(|(name, p)| {
+            let client = self.provider(name);
+            let mut row = ProviderModels {
+                name: name.clone(),
+                kind: p.kind.clone(),
+                base_url: p.base_url.clone(),
+                ..Default::default()
+            };
+            async move {
+                match client {
+                    Err(e) => row.error = format!("{e:#}"),
+                    Ok(client) => match tokio::time::timeout(Duration::from_secs(12), client.list_models()).await {
+                        Ok(Ok(models)) => row.models = models,
+                        Ok(Err(e)) => row.error = first_line(&format!("{e:#}"), 200),
+                        Err(_) => row.error = "no answer within 12 seconds".into(),
+                    },
+                }
+                row
+            }
+        });
+        futures_util::future::join_all(lookups).await
+    }
+
+    /// Hand a session to another model, between turns.
+    pub fn switch_model(&self, sid: &str, model: &str) -> Result<()> {
+        self.validate_model(model)?;
+        let session = self.store.require_session(sid)?;
+        if self.is_running(sid) {
+            bail!("the session is busy; change the model between turns");
+        }
+        if session.model == model {
+            return Ok(());
+        }
+        self.store.switch_model(sid, model)?;
+        if self.store.message_count(sid)? > 0 {
+            // In the transcript, so the new model knows the earlier turns were not its own.
+            let note = [Block::Text {
+                text: format!(
+                    "[narsil] The model for this conversation changed from {} to {model}. Earlier replies were \
+                     written by the previous model.",
+                    session.model
+                ),
+            }];
+            let msg = self.store.append_message(sid, Role::User, MsgKind::Note, &note)?;
+            self.emit(&session, Event::Message { msg });
+        }
+        self.emit(&session, Event::SessionChanged);
+        Ok(())
+    }
+
+    /// Change `[model] default` or `[model] subagent` in config.toml and apply it.
+    pub fn set_config_model(&self, role: &str, model: &str) -> Result<()> {
+        if !(role == "subagent" && model.is_empty()) {
+            self.validate_model(model)?;
+        }
+        // From disk, so edits made by hand since the daemon started are kept.
+        let mut cfg = Config::load(&self.paths)?;
+        match role {
+            "default" => cfg.model.default = model.to_string(),
+            "subagent" => cfg.model.subagent = model.to_string(),
+            other => bail!("unknown model role {other:?} (expected default or subagent)"),
+        }
+        cfg.save(&self.paths)?;
+        self.reload_config()
     }
 
     pub fn default_model(&self, requested: Option<String>) -> Result<String> {

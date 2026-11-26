@@ -35,6 +35,11 @@ pub enum Command {
     Approve { id: String, decision: String },
     SetMode { session: String, mode: String },
     SetModel { session: String, model: String },
+    /// Every configured provider with the models it offers right now.
+    Models,
+    /// Change the model that new sessions (`default`) or subagents (`subagent`)
+    /// use. Saved to config.toml. An empty subagent model means "the session's".
+    SetConfigModel { role: String, model: String },
     Compact { session: String },
     GoalAdd { objective: String, cwd: String, model: Option<String> },
     GoalAction { id: String, action: String },
@@ -88,6 +93,17 @@ pub enum Event {
     SessionChanged,
 }
 
+/// A configured backend and what it offers, for choosing a model.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ProviderModels {
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+    /// Why the list could not be fetched; empty when it could.
+    pub error: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ApprovalInfo {
     pub id: String,
@@ -112,6 +128,8 @@ mod tests {
             Command::GoalAction { id: "g1".into(), action: "pause".into() },
             Command::Send { session: "s".into(), text: "hi\nthere".into() },
             Command::SessionCreate { cwd: "/w".into(), title: None, model: Some("p/m".into()) },
+            Command::Models,
+            Command::SetConfigModel { role: "subagent".into(), model: String::new() },
         ];
         for (n, cmd) in cmds.into_iter().enumerate() {
             let line = serde_json::to_string(&Request { id: n as u64 + 7, cmd: cmd.clone() }).unwrap();

@@ -2,6 +2,7 @@
 //! reopening it shows the session exactly as the daemon has it.
 
 mod input;
+mod models;
 mod render;
 
 use std::collections::VecDeque;
@@ -24,11 +25,12 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use self::input::InputBox;
+use self::models::{Picker, Target};
 use self::render::{Entry, Item, SPINNER, agent_label, agent_mark, agent_status, markdown, wrap};
 use crate::client::Conn;
 use crate::config::{Config, Paths};
 use crate::context;
-use crate::proto::{ApprovalInfo, Command, Envelope, Event};
+use crate::proto::{ApprovalInfo, Command, Envelope, Event, ProviderModels};
 use crate::store::{AgentInfo, Goal, Objective, Session, Store};
 use crate::types::{Block, MsgKind, Role, StoredMessage};
 use crate::util::{first_line, fmt_age, fmt_duration, fmt_tokens, home, now};
@@ -71,9 +73,15 @@ Memory
   /memory [query]  list or search          /remember <text>     save a global memory
   /forget <id>     delete a memory
 
+Models
+  /model           pick a model from every configured provider: type to filter, enter selects,
+                   tab switches between this session, new sessions and subagents
+  /model <text>    the same, already filtered; a full provider/model-id switches at once
+  /provider [name] list the providers, or one provider's models (add providers: narsil setup)
+
 Settings
-  /model [p/m]     show or change model    /auto  /ask          permission mode
-  /reload          re-read config.toml     /quit
+  /auto  /ask      permission mode         /reload              re-read config.toml
+  /quit
 
 Typing while the agent works queues your message; it is delivered at the next step.";
 
@@ -83,6 +91,8 @@ enum Overlay {
     Goals { list: Vec<Goal>, sel: usize },
     /// The subagents of the session on screen, read live at draw time.
     Agents { sel: usize },
+    Models(Picker),
+    Providers { data: Picker, sel: usize },
     Text { title: String, lines: Vec<String>, scroll: usize },
 }
 
@@ -107,6 +117,13 @@ struct Nav {
 enum Bg {
     Done { label: String, result: Result<Value, String> },
     Voice(Result<String, String>),
+    Models { result: Result<Value, String>, view: PickerView },
+}
+
+/// What to open once the model lists have arrived.
+enum PickerView {
+    Models { only: Option<String>, filter: String },
+    Providers,
 }
 
 struct App {
@@ -153,6 +170,8 @@ struct App {
     transcribing: bool,
     /// Permission mode chosen with /auto or /ask before the session exists.
     pending_mode: Option<String>,
+    /// Model chosen with /model before the session exists.
+    pending_model: Option<String>,
     bg_tx: mpsc::UnboundedSender<Bg>,
 }
 
@@ -200,6 +219,7 @@ pub async fn run(paths: Paths, cfg: Config, opts: Opts) -> Result<()> {
         recorder: None,
         transcribing: false,
         pending_mode: None,
+        pending_model: None,
         bg_tx,
     };
     // Resolve the starting session before taking over the terminal, so that
@@ -727,6 +747,13 @@ impl App {
                 (label, Ok(_)) => self.flash(format!("{label}: done")),
                 (label, Err(e)) => self.error(format!("{label}: {e}")),
             },
+            Bg::Models { result, view } => {
+                self.flash = None;
+                match result {
+                    Ok(v) => self.show_picker(v, view),
+                    Err(e) => self.error(format!("could not list models: {e}")),
+                }
+            }
             Bg::Voice(result) => {
                 self.transcribing = false;
                 match result {
@@ -757,17 +784,98 @@ impl App {
         });
     }
 
+    // ---- choosing a model -------------------------------------------------
+
+    /// The model a message sent now would go to.
+    fn model_in_use(&self) -> String {
+        match (&self.session, &self.pending_model) {
+            (Some(s), _) => s.model.clone(),
+            (None, Some(m)) => m.clone(),
+            (None, None) => self.cfg.model.default.clone(),
+        }
+    }
+
+    /// Ask the daemon what every provider offers, then open a picker.
+    fn fetch_models(&mut self, view: PickerView) {
+        self.flash("asking the providers for their models…");
+        let tx = self.bg_tx.clone();
+        let conn = self.conn.clone();
+        tokio::spawn(async move {
+            let result = conn.call(Command::Models).await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Bg::Models { result, view });
+        });
+    }
+
+    fn show_picker(&mut self, v: Value, view: PickerView) {
+        let all: Vec<ProviderModels> = serde_json::from_value(v["providers"].clone()).unwrap_or_default();
+        let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        let mut picker = Picker::new(all, self.model_in_use(), text("default"), text("subagent"));
+        match view {
+            PickerView::Providers => {
+                let in_use = picker.session.split('/').next().unwrap_or_default().to_string();
+                let sel = picker.all.iter().position(|p| p.name == in_use).unwrap_or(0);
+                self.overlay = Overlay::Providers { data: picker, sel };
+            }
+            PickerView::Models { only, filter } => {
+                if let Some(name) = &only {
+                    if !picker.all.iter().any(|p| p.name == *name) {
+                        self.flash(format!("there is no provider named {name}; /provider lists them"));
+                        return;
+                    }
+                }
+                picker.only = only;
+                picker.filter = filter;
+                picker.seek_current();
+                self.overlay = Overlay::Models(picker);
+            }
+        }
+    }
+
+    /// Use `model` for the session on screen, for new sessions, or for subagents.
+    async fn apply_model(&mut self, target: Target, model: String) {
+        match target {
+            Target::Session => match self.sid() {
+                Some(sid) => match self.conn.call(Command::SetModel { session: sid, model: model.clone() }).await {
+                    // The transcript records the change; the status line shows the new model.
+                    Ok(_) => self.refresh_session().await,
+                    Err(e) => self.error(format!("{e:#}")),
+                },
+                None => {
+                    self.flash(format!("the next session will use {model}"));
+                    self.pending_model = Some(model);
+                }
+            },
+            Target::Default | Target::Subagent => {
+                let role = if target == Target::Default { "default" } else { "subagent" };
+                match self.conn.call(Command::SetConfigModel { role: role.into(), model: model.clone() }).await {
+                    Ok(_) => {
+                        if let Ok(cfg) = Config::load(&self.paths) {
+                            self.cfg = cfg;
+                        }
+                        self.flash(match (target, model.is_empty()) {
+                            (Target::Default, _) => format!("new sessions will use {model} (saved to config.toml)"),
+                            (_, true) => "subagents will use the same model as their session (saved to config.toml)".into(),
+                            (_, false) => format!("subagents will use {model} (saved to config.toml)"),
+                        });
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+        }
+    }
+
     // ---- actions ----------------------------------------------------------
 
     async fn send(&mut self, text: String) {
         if self.session.is_none() {
             let created = self
                 .conn
-                .call(Command::SessionCreate { cwd: self.cwd.clone(), title: None, model: None })
+                .call(Command::SessionCreate { cwd: self.cwd.clone(), title: None, model: self.pending_model.clone() })
                 .await
                 .and_then(|v| Ok(serde_json::from_value::<Session>(v["session"].clone())?));
             match created {
                 Ok(s) => {
+                    self.pending_model = None;
                     if let Some(mode) = self.pending_mode.take() {
                         let _ = self.conn.call(Command::SetMode { session: s.id.clone(), mode }).await;
                     }
@@ -946,20 +1054,20 @@ impl App {
                     Err(e) => self.error(format!("{e:#}")),
                 }
             }
-            "/model" => {
-                if arg.is_empty() {
-                    let current = self.session.as_ref().map(|s| s.model.clone()).unwrap_or_else(|| self.cfg.model.default.clone());
-                    let providers: Vec<&str> = self.cfg.providers.keys().map(String::as_str).collect();
-                    self.note(format!("model: {current}. Change with /model provider/model-id (providers: {})", providers.join(", ")));
-                    return;
+            "/model" | "/models" => {
+                // A complete `provider/model-id` switches at once; anything else opens the list.
+                let provider = arg.split_once('/').map(|(p, _)| p).unwrap_or_default();
+                if self.cfg.providers.contains_key(provider) && !arg.contains(char::is_whitespace) {
+                    self.apply_model(Target::Session, arg.to_string()).await;
+                } else {
+                    self.fetch_models(PickerView::Models { only: None, filter: arg.to_string() });
                 }
-                let Some(sid) = need_session(self) else { return };
-                match self.conn.call(Command::SetModel { session: sid, model: arg.to_string() }).await {
-                    Ok(_) => {
-                        self.refresh_session().await;
-                        self.note(format!("model for this session is now {arg}"));
-                    }
-                    Err(e) => self.error(format!("{e:#}")),
+            }
+            "/provider" | "/providers" => {
+                if arg.is_empty() {
+                    self.fetch_models(PickerView::Providers);
+                } else {
+                    self.fetch_models(PickerView::Models { only: Some(arg.to_string()), filter: String::new() });
                 }
             }
             "/reload" => match self.conn.call(Command::Reload).await {
@@ -1173,6 +1281,38 @@ impl App {
 
     async fn overlay_key(&mut self, key: KeyEvent) {
         let code = key.code;
+        if let Overlay::Models(p) = &mut self.overlay {
+            // Letters go to the filter here, so this list has its own keys.
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let page = self.view_h.saturating_sub(4).max(1) as i64;
+            let mut chosen: Option<(Target, String)> = None;
+            let mut close = false;
+            match code {
+                KeyCode::Esc if p.filter.is_empty() => close = true,
+                KeyCode::Esc => {
+                    p.filter.clear();
+                    p.seek_current();
+                }
+                KeyCode::Char('c') if ctrl => close = true,
+                KeyCode::Up => p.move_by(-1),
+                KeyCode::Down => p.move_by(1),
+                KeyCode::PageUp => p.move_by(-page),
+                KeyCode::PageDown => p.move_by(page),
+                KeyCode::Tab => p.cycle_target(true),
+                KeyCode::BackTab => p.cycle_target(false),
+                KeyCode::Backspace => p.erase(),
+                KeyCode::Enter => chosen = p.selected().map(|m| (p.target, m)),
+                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => p.type_char(c),
+                _ => {}
+            }
+            if let Some((target, model)) = chosen {
+                self.overlay = Overlay::None;
+                self.apply_model(target, model).await;
+            } else if close {
+                self.overlay = Overlay::None;
+            }
+            return;
+        }
         let close = matches!(code, KeyCode::Esc | KeyCode::Char('q'))
             || (code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
         if close {
@@ -1184,6 +1324,7 @@ impl App {
         let mut goal_action: Option<(String, &'static str)> = None;
         let agent_ids: Vec<String> = self.my_agents().iter().map(|a| a.id.clone()).collect();
         let mut open_agent: Option<String> = None;
+        let mut open_provider: Option<String> = None;
         match &mut self.overlay {
             Overlay::Agents { sel } => match code {
                 KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
@@ -1191,6 +1332,13 @@ impl App {
                 KeyCode::Enter => open_agent = agent_ids.get(*sel).cloned(),
                 _ => {}
             },
+            Overlay::Providers { data, sel } => match code {
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1).min(data.all.len().saturating_sub(1)),
+                KeyCode::Enter => open_provider = data.all.get(*sel).map(|p| p.name.clone()),
+                _ => {}
+            },
+            Overlay::Models(_) => {}
             Overlay::Sessions { list, sel } => match code {
                 KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1).min(list.len().saturating_sub(1)),
@@ -1231,6 +1379,14 @@ impl App {
         if let Some(id) = open_agent {
             self.overlay = Overlay::None;
             self.open_agent(&id).await;
+        }
+        if let Some(name) = open_provider {
+            // The lists are already here: narrow the same data to this provider.
+            if let Overlay::Providers { mut data, .. } = std::mem::replace(&mut self.overlay, Overlay::None) {
+                data.only = Some(name);
+                data.seek_current();
+                self.overlay = Overlay::Models(data);
+            }
         }
         if let Some((id, action)) = goal_action {
             match self.conn.call(Command::GoalAction { id, action: action.into() }).await {
@@ -1646,7 +1802,7 @@ impl App {
         let mut lines = vec![
             Line::default(),
             Line::styled("narsil", Style::new().add_modifier(Modifier::BOLD).fg(Color::LightBlue)),
-            Line::styled(format!("model {}   ·   {}", self.cfg.model.default, self.short_cwd(width.saturating_sub(30))), dim),
+            Line::styled(format!("model {}   ·   {}", self.model_in_use(), self.short_cwd(width.saturating_sub(30))), dim),
             Line::default(),
         ];
         let tips = "Type a message and press enter. The agent can run shell commands and edit files here.\n\
@@ -1732,7 +1888,7 @@ impl App {
         }
         let right = match &self.session {
             Some(s) => format!("ctx {} · {} · {} ", fmt_tokens(s.context_tokens), s.perm_mode, s.model),
-            None => format!("{} · {} ", self.pending_mode.as_deref().unwrap_or(&self.cfg.permissions.mode), self.cfg.model.default),
+            None => format!("{} · {} ", self.pending_mode.as_deref().unwrap_or(&self.cfg.permissions.mode), self.model_in_use()),
         };
         let width = area.width as usize;
         let room = width.saturating_sub(right.chars().count() + 1);
@@ -1800,6 +1956,16 @@ impl App {
                     "enter open · esc close",
                 )
             }
+            Overlay::Models(p) => {
+                let (lines, sel) = p.lines();
+                (p.title(), lines, sel, "type to filter · enter select · tab session/new sessions/subagents · esc")
+            }
+            Overlay::Providers { data, sel } => (
+                "providers".into(),
+                data.provider_lines(),
+                Some((*sel).min(data.all.len().saturating_sub(1))),
+                "enter show its models · esc close · add one with `narsil setup`",
+            ),
             Overlay::Text { title, lines, .. } => (title.clone(), lines.clone(), None, "↑↓ scroll · esc close"),
         };
         let w = area.width.saturating_sub(6).clamp(20, 100).min(area.width);

@@ -99,6 +99,18 @@ live. There, esc returns to the parent, a message you send is delivered at its n
 stops that one subagent while the others carry on. All of this survives closing the TUI, `narsil
 stop`, and a crash: the roster is read back from the store.
 
+### Models
+
+`/model` lists the models of every configured provider, fetched live. Type to filter, press enter to
+select, and use tab to choose what the selection applies to: this session, new sessions
+(`[model] default`) or subagents (`[model] subagent`). `/model haiku` opens the list already filtered,
+and a full `/model provider/model-id` switches at once. `/provider` lists the providers and
+`/provider <name>` one provider's models. Providers are added with `narsil setup`.
+
+A session can change model between turns, including to another provider. The transcript records the
+change, the new model gets a fresh system prompt, and the previous model's reasoning blocks are no
+longer replayed. From the shell: `narsil run --session <id> --model <provider/model-id> "..."`.
+
 ### Context
 
 A session's system prompt is assembled once per context epoch from: the harness preamble, `SOUL.md`,
@@ -145,8 +157,8 @@ For work that should continue after you log out, run `narsil service install` an
 | ctrl+d | quit; the daemon and any running work continue |
 
 Commands: `/new` `/sessions` `/resume <id>` `/continue` `/compact` `/goal <objective>` `/goals`
-`/pause` `/agents` `/back` `/memory [query]` `/remember <text>` `/forget <id>` `/model [provider/model]`
-`/auto` `/ask` `/panel` `/reload` `/title <text>` `/help`.
+`/pause` `/agents` `/back` `/model [text]` `/provider [name]` `/memory [query]` `/remember <text>`
+`/forget <id>` `/auto` `/ask` `/panel` `/reload` `/title <text>` `/help`.
 
 The side panel appears when the session has a goal, objectives or subagents. It lists the goal, the
 objectives with their status and the subagents working on each, and recorded milestones.

@@ -297,13 +297,20 @@ async fn handle(
             Ok(Value::Null)
         }
         Command::SetModel { session, model } => {
-            engine.validate_model(&model)?;
             let id = store.resolve_session(&session)?;
-            if engine.is_running(&id) {
-                bail!("the session is busy; change the model between turns");
-            }
-            store.set_model(&id, &model)?;
-            engine.emit(&store.require_session(&id)?, Event::SessionChanged);
+            engine.switch_model(&id, model.trim())?;
+            Ok(Value::Null)
+        }
+        Command::Models => {
+            let cfg = engine.cfg();
+            Ok(json!({
+                "providers": engine.list_models().await,
+                "default": cfg.model.default,
+                "subagent": cfg.model.subagent,
+            }))
+        }
+        Command::SetConfigModel { role, model } => {
+            engine.set_config_model(&role, model.trim())?;
             Ok(Value::Null)
         }
         Command::Compact { session } => {

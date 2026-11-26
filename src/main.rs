@@ -343,7 +343,12 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
     let sid = match &a.session {
         Some(s) => {
             let v = conn.call(Command::SessionGet { id: s.clone() }).await?;
-            v["session"]["id"].as_str().unwrap_or_default().to_string()
+            let id = v["session"]["id"].as_str().unwrap_or_default().to_string();
+            // `--model` on an existing session hands it to that model from here on.
+            if let Some(model) = &a.model {
+                conn.call(Command::SetModel { session: id.clone(), model: model.clone() }).await?;
+            }
+            id
         }
         None => {
             let v = conn.call(Command::SessionCreate { cwd: dir, title: None, model: a.model.clone() }).await?;
