@@ -100,6 +100,28 @@ Enter on a file opens a window on **what narsil has done to that file**: each re
 latest first, with what an edit took out and put in, and below that what stands changed in the file
 against git. From there enter goes to that step in the conversation, and esc closes the window.
 
+## Themes
+
+`/theme` opens the list of colour themes. Moving over one puts it in force, so the whole screen shows
+what it would be; enter keeps it, esc goes back to the one you had. The choice is saved as `theme`
+under `[tui]` in `config.toml`, and `/theme gruvbox` sets one directly.
+
+| Theme | |
+| --- | --- |
+| `terminal` | your terminal's own colours (the default) |
+| `gruvbox`, `gruvbox-light` | warm and low in contrast, on dark or on cream |
+| `solarized`, `solarized-light` | the measured sixteen, on deep teal or on paper |
+| `dracula` | purple and pink, on slate |
+| `nord` | arctic blues |
+| `tokyo-night` | neon on midnight blue |
+| `catppuccin` | soft pastels, on mocha |
+| `monokai` | loud and bright, on olive black |
+| `one-dark` | even and familiar, on charcoal |
+| `amber`, `phosphor` | an amber monitor and a green phosphor terminal |
+
+A theme sets what everything stands on as well as the colours, so it looks the same whatever the
+terminal's own palette is. On a terminal without 24-bit colour the nearest of 256 colours are used.
+
 ## Commands
 
 Slash commands complete as you type: the rest of the best match shows dimmed, tab or the right arrow
@@ -108,7 +130,8 @@ takes it, and more tabs walk through the others. After `/cd`, tab completes fold
 `/new` `/clear` `/sessions` `/resume <id>` `/continue` `/compact` `/goal <objective>` `/goals`
 `/pause` `/cleargoal` `/agents` `/back` `/cd <dir>` `/files` `/panel` `/model [text]`
 `/provider [name]` `/memory [query]` `/remember <text>` `/forget <id>` `/trace` `/stats`
-`/logs [errors]` `/keys` `/auto` `/ask` `/reload` `/daemonrestart` `/title <text>` `/help`.
+`/logs [errors]` `/theme [name]` `/keys` `/auto` `/ask` `/reload` `/daemonrestart` `/title <text>`
+`/help`.
 
 `/daemonrestart` stops the daemon and starts it again with the narsil program as it is on disk now
 (after an update, say), and gives every open tab a new connection with its session taken up again.

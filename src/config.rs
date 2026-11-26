@@ -520,11 +520,14 @@ pub struct NotifyConfig {
 pub struct TuiConfig {
     pub mouse: bool,
     pub show_thinking: bool,
+    /// The colour theme: `terminal` for the terminal's own colours, or one of
+    /// the themes `/theme` lists.
+    pub theme: String,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
-        TuiConfig { mouse: true, show_thinking: true }
+        TuiConfig { mouse: true, show_thinking: true, theme: "terminal".into() }
     }
 }
 
@@ -734,7 +737,10 @@ pub fn render_config(c: &Config) -> String {
 
     s.push_str("[tui]\n");
     s.push_str(&format!("mouse = {}\n", c.tui.mouse));
-    s.push_str(&format!("show_thinking = {}\n\n", c.tui.show_thinking));
+    s.push_str(&format!("show_thinking = {}\n", c.tui.show_thinking));
+    s.push_str("# The colour theme: \"terminal\" keeps your terminal's own colours. /theme in the TUI lists the\n");
+    s.push_str("# others (gruvbox, solarized, dracula, nord, tokyo-night, ...), tries them, and saves your choice here.\n");
+    s.push_str(&format!("theme = {}\n\n", q(&c.tui.theme)));
 
     s.push_str("[obsidian]\n");
     s.push_str("# Path of an Obsidian vault. Empty: no integration. With a vault set, the agent can\n");

@@ -1203,11 +1203,47 @@ fn cmd_stats(paths: &Paths, since: &str) -> Result<()> {
     Ok(())
 }
 
+/// A log line as written to a terminal: each part in its own colour, as in the TUI's /logs.
+/// `level` is the level of the line before, for a line that continues it; the level of this one is returned.
+fn coloured_log_line(line: &str, level: u8) -> (String, u8) {
+    use telemetry::LogPart::*;
+    let (parts, level) = telemetry::log_parts(line, level);
+    let mut out = String::new();
+    for (part, piece) in parts {
+        let tint = match part {
+            Time | Mark | Key | Text(0) => "\x1b[90m",
+            Level(3) => "\x1b[1;31m",
+            Level(2) => "\x1b[1;33m",
+            Level(1) => "\x1b[32m",
+            Level(_) | Value => "\x1b[36m",
+            Session => "\x1b[94m",
+            Agent | Text(2) => "\x1b[33m",
+            Goal => "\x1b[35m",
+            Text(3) => "\x1b[31m",
+            Text(_) => "",
+        };
+        if tint.is_empty() { out.push_str(&piece) } else { out.push_str(&format!("{tint}{piece}\x1b[0m")) }
+    }
+    (out, level)
+}
+
 fn cmd_logs(paths: &Paths, follow: bool, lines: usize, session: Option<String>) -> Result<()> {
     let file = paths.log_file();
     if !file.exists() {
         bail!("no log yet at {}", file.display());
     }
+    // In colour on a terminal; as written when it goes to a file or another program.
+    let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut level = 1u8;
+    let mut show = |line: &str| {
+        if colour {
+            let (painted, now) = coloured_log_line(line, level);
+            level = now;
+            println!("{painted}");
+        } else {
+            println!("{line}");
+        }
+    };
     if let Some(id) = session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         // A session id may be given in short, as elsewhere; a goal id is taken as it is.
         let id = open_store(paths).ok().and_then(|s| s.resolve_session(id).ok()).unwrap_or_else(|| id.to_string());
@@ -1221,7 +1257,7 @@ fn cmd_logs(paths: &Paths, follow: bool, lines: usize, session: Option<String>) 
                 Some(n) => n.min(mine.len()),
             };
             for line in &mine[from..] {
-                println!("{line}");
+                show(line);
             }
             seen = Some(mine.len());
             if !follow {
@@ -1233,15 +1269,33 @@ fn cmd_logs(paths: &Paths, follow: bool, lines: usize, session: Option<String>) 
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
-    if follow {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new("tail").arg("-n").arg(lines.to_string()).arg("-f").arg(&file).exec();
-        bail!("could not run tail: {err}");
-    }
-    let text = std::fs::read_to_string(&file)?;
+    // The last lines, and then, if asked to follow, each new one as it is written.
+    let mut text = std::fs::read_to_string(&file)?;
     let all: Vec<&str> = text.lines().collect();
     for line in &all[all.len().saturating_sub(lines)..] {
-        println!("{line}");
+        show(line);
     }
-    Ok(())
+    if !follow {
+        return Ok(());
+    }
+    let mut read = text.len() as u64;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        if size < read {
+            // The file was started afresh.
+            read = 0;
+        }
+        if size > read {
+            use std::io::{Read as _, Seek as _};
+            let mut f = std::fs::File::open(&file)?;
+            f.seek(std::io::SeekFrom::Start(read))?;
+            text.clear();
+            f.read_to_string(&mut text)?;
+            // Only whole lines: one still being written waits for its end.
+            let whole = text.rfind('\n').map(|at| at + 1).unwrap_or(0);
+            text[..whole].lines().for_each(&mut show);
+            read += whole as u64;
+        }
+    }
 }

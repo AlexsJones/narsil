@@ -24,6 +24,7 @@ pub const COMMANDS: &[Cmd] = &[
     cmd("/stats", "", "time and tokens in this session"),
     cmd("/trace", "", "the tree of what was done"),
     cmd("/title", "<text>", "rename this session"),
+    cmd("/theme", "[name]", "choose a colour theme"),
     cmd("/model", "[filter, or provider/model-id]", "choose a model"),
     cmd("/memory", "[query]", "list or search memory"),
     cmd("/new", "", "start a fresh session"),

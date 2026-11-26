@@ -23,6 +23,11 @@ narsil talks to Anthropic directly, and to everything that speaks OpenAI-style c
 OpenAI, Gemini, OpenRouter, DeepSeek, Mistral, Groq, xAI, and local servers such as llama.cpp,
 Ollama, LM Studio and vLLM.
 
+`narsil run` lays its output out for reading when it is on a terminal: each step the agent takes on
+a line of its own with what it came to beneath, a request for your leave shown in full, and the answer
+flowed to the window. Into a pipe or a file it writes the answer alone on standard output, as plain
+text, with the steps on standard error.
+
 ## Updating
 
 ```sh

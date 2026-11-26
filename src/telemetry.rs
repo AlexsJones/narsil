@@ -461,6 +461,93 @@ pub fn line_level(line: &str) -> Option<u8> {
     })
 }
 
+/// What a stretch of a log line is, for giving each its own colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogPart {
+    Time,
+    /// The level, by how serious (0 debug and trace, 1 info, 2 warn, 3 error).
+    Level(u8),
+    /// The brackets and the `>` around whose line it is.
+    Mark,
+    /// A session's id.
+    Session,
+    /// A subagent's name.
+    Agent,
+    /// `goal:<id>`.
+    Goal,
+    /// What happened, in a line of this level.
+    Text(u8),
+    /// The name of a recorded value (`tool=`), and the value.
+    Key,
+    Value,
+}
+
+/// A log line taken apart: the time, the level, whose it is, what happened,
+/// and the values recorded with it. `level` is the level of the line this one
+/// continues, for a line with no start of its own (a long line run on, a
+/// message of several lines); it is returned for the next.
+pub fn log_parts(line: &str, level: u8) -> (Vec<(LogPart, String)>, u8) {
+    static HEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^((?:\d{4}-\d\d-\d\d )?\d\d:\d\d:\d\d(?:\.\d+)?)(\s+)(TRACE|DEBUG|INFO|WARN|ERROR)( )(?:\[([^\]]*)\]( ))?").expect("a valid pattern")
+    });
+    static VALUE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"\b([a-z_][a-z0-9_]*)=("[^"]*"|\S+)"#).expect("a valid pattern"));
+    let mut out: Vec<(LogPart, String)> = Vec::new();
+    let mut level = level;
+    let mut rest = line;
+    if let Some(head) = HEAD.captures(line) {
+        level = match &head[3] {
+            "ERROR" => 3,
+            "WARN" => 2,
+            "INFO" => 1,
+            _ => 0,
+        };
+        out.push((LogPart::Time, head[1].to_string()));
+        out.push((LogPart::Text(1), head[2].to_string()));
+        out.push((LogPart::Level(level), head[3].to_string()));
+        out.push((LogPart::Text(1), head[4].to_string()));
+        if let Some(owner) = head.get(5) {
+            out.push((LogPart::Mark, "[".into()));
+            for (i, word) in owner.as_str().split(' ').enumerate() {
+                if i > 0 {
+                    out.push((LogPart::Mark, " ".into()));
+                }
+                if let Some(goal) = word.strip_prefix("goal:") {
+                    out.push((LogPart::Goal, format!("goal:{goal}")));
+                } else if i == 0 {
+                    // `root>session`: the session it works for, then its own.
+                    for (j, id) in word.split('>').enumerate() {
+                        if j > 0 {
+                            out.push((LogPart::Mark, ">".into()));
+                        }
+                        out.push((LogPart::Session, id.to_string()));
+                    }
+                } else {
+                    out.push((LogPart::Agent, word.to_string()));
+                }
+            }
+            out.push((LogPart::Mark, "]".into()));
+            out.push((LogPart::Text(1), head[6].to_string()));
+        }
+        rest = &line[head.get(0).map(|m| m.end()).unwrap_or(0)..];
+    }
+    // What happened, with any `name=value` in it picked out.
+    let mut at = 0;
+    for found in VALUE.captures_iter(rest) {
+        let whole = found.get(0).expect("the whole match");
+        if whole.start() > at {
+            out.push((LogPart::Text(level), rest[at..whole.start()].to_string()));
+        }
+        out.push((LogPart::Key, format!("{}=", &found[1])));
+        out.push((LogPart::Value, found[2].to_string()));
+        at = whole.end();
+    }
+    if at < rest.len() {
+        out.push((LogPart::Text(level), rest[at..].to_string()));
+    }
+    (out, level)
+}
+
 /// The lines of a log to show: at or above a level, of one session (with its
 /// subagents) or goal if `owner` is given, and holding `find` if that is not
 /// empty. A line that continues another goes or stays with it. The date is
@@ -1293,6 +1380,57 @@ mod tests {
         assert_eq!(of("gggg9999"), ["14:00:04.000", "14:00:05.000"]);
         assert!(lines_of(log, "zzzz0000").is_empty());
         assert_eq!(line_owner("2026-11-26 14:00:06.000  INFO work: 3 notes read"), Who::default());
+    }
+
+    #[test]
+    fn a_log_line_comes_apart_into_what_each_piece_is() {
+        use LogPart::*;
+        let (parts, level) = log_parts("14:38:49.402 DEBUG [w31q3ky4>9xk2m1aa count-two goal:x6j4z062] tool call finished tool=bash is_error=false note=\"two words\"", 1);
+        assert_eq!(level, 0);
+        let got: Vec<(LogPart, &str)> = parts.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (Time, "14:38:49.402"),
+                (Text(1), " "),
+                (Level(0), "DEBUG"),
+                (Text(1), " "),
+                (Mark, "["),
+                (Session, "w31q3ky4"),
+                (Mark, ">"),
+                (Session, "9xk2m1aa"),
+                (Mark, " "),
+                (Agent, "count-two"),
+                (Mark, " "),
+                (Goal, "goal:x6j4z062"),
+                (Mark, "]"),
+                (Text(1), " "),
+                (Text(0), "tool call finished "),
+                (Key, "tool="),
+                (Value, "bash"),
+                (Text(0), " "),
+                (Key, "is_error="),
+                (Value, "false"),
+                (Text(0), " "),
+                (Key, "note="),
+                (Value, "\"two words\""),
+            ]
+        );
+        // Nothing of the line is lost, whatever it holds.
+        for line in [
+            "2026-11-26 14:00:04.000 ERROR [cccc3333] session run failed: boom",
+            "14:00:00.000  INFO narsil daemon 0.1.0 starting (pid 1)",
+            "    a line that only continues the one before, with x=1 in it",
+            "",
+        ] {
+            let (parts, _) = log_parts(line, 2);
+            assert_eq!(parts.iter().map(|(_, t)| t.as_str()).collect::<String>(), line);
+        }
+        // A line with no start of its own keeps the level of the line it continues.
+        let (parts, level) = log_parts("    Timeout after 30s", 3);
+        assert_eq!((parts, level), (vec![(Text(3), "    Timeout after 30s".to_string())], 3));
+        assert_eq!(log_parts("14:00:04.000 ERROR [cccc3333] boom", 0).1, 3);
+        assert_eq!(log_parts("2026-11-26 14:00:00.000  WARN notes: away", 0).0[2], (Level(2), "WARN".to_string()));
     }
 
     #[test]

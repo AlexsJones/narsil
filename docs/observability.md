@@ -69,6 +69,10 @@ In the TUI, `/logs` opens the log in a window: this session's lines, with its su
 as they are written. `e` shows errors only, `w` warnings and errors, `i` info and up, `a` everything;
 `s` switches between this session and all of them; `/` finds text; `f` goes back to following.
 Long lines are wrapped in full; `l` cuts them off at the edge instead, one line each.
+Each part of a line has its own colour: the time and the names of recorded values recede, the level
+is green, yellow or red by how serious it is, the session id, a subagent's name and a goal's id each
+stand out differently, and a line that reports trouble is tinted as a whole. `narsil logs` shows the
+same colours on a terminal, and writes plain text into a pipe or a file.
 `/logs errors` opens straight on the errors.
 
 The log is leveled:

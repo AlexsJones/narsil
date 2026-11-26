@@ -7,6 +7,7 @@ mod input;
 mod keys;
 mod models;
 mod render;
+mod theme;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -71,6 +72,8 @@ Tabs (each tab is a session of its own; they all keep working at once)
 Sessions
   /new             start a fresh session   /sessions            pick a session to resume
   /resume <id>     open a session by id    /title <text>        rename this session
+  /theme [name]    choose a colour theme (gruvbox, solarized, dracula, nord, tokyo-night, catppuccin,
+                   monokai, one-dark, amber, phosphor, or your terminal's own); it is kept
   /logs [errors]   the daemon log in a window: this session's lines, following as they are written.
                    e errors, w warnings, i info, a all; s this session or all; / find text;
                    l wraps long lines or cuts them off
@@ -135,6 +138,8 @@ enum Overlay {
     Models(Picker),
     Providers { data: Picker, sel: usize },
     Text { title: String, lines: Vec<String>, scroll: usize },
+    /// The themes, the one under the selection in force as it is moved over, and the one to go back to.
+    Themes { sel: usize, before: String },
 }
 
 /// What the /logs window is showing: how serious, whose, and holding what.
@@ -194,6 +199,27 @@ fn side_widths(total: u16, files: bool, panel: bool, files_last: bool) -> (u16, 
         }
         (true, true) if files_last => (alone(total / 4, FILES), 0),
         (true, true) => (0, alone(total / 3, PANEL)),
+    }
+}
+
+/// The colour of each part of a log line.
+fn log_style(part: crate::telemetry::LogPart) -> Style {
+    use crate::telemetry::LogPart::*;
+    match part {
+        Time | Mark | Key => Style::new().fg(Color::DarkGray),
+        Level(3) => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Level(2) => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Level(1) => Style::new().fg(Color::Green),
+        Level(_) => Style::new().fg(Color::Cyan),
+        Session => Style::new().fg(Color::LightBlue),
+        Agent => Style::new().fg(Color::Yellow),
+        Goal => Style::new().fg(Color::Magenta),
+        Value => Style::new().fg(Color::Cyan),
+        // What happened is plain, unless it is trouble; detail that was asked for recedes.
+        Text(3) => Style::new().fg(Color::Red),
+        Text(2) => Style::new().fg(Color::Yellow),
+        Text(0) => Style::new().fg(Color::DarkGray),
+        Text(_) => Style::new(),
     }
 }
 
@@ -649,6 +675,13 @@ impl Tabs {
             area
         };
         self.app().draw(f, below);
+        self.draw_keys(f, area);
+        // Last of all, the theme is laid over what has been drawn: every part of the
+        // interface follows it without knowing there is one.
+        theme::paint(f.buffer_mut());
+    }
+
+    fn draw_keys(&mut self, f: &mut Frame, area: Rect) {
         if let Some(scroll) = self.keys_window {
             let lines = self.keys.listing();
             let w = area.width.saturating_sub(6).clamp(20, 104).min(area.width);
@@ -755,6 +788,9 @@ pub async fn run(paths: Paths, cfg: Config, opts: Opts) -> Result<()> {
     }
     if let Some(problem) = keys.problems.first() {
         app.flash(problem.clone());
+    }
+    if !theme::set(&app.cfg.tui.theme) {
+        app.flash(format!("there is no theme called {:?}: /theme lists them", app.cfg.tui.theme));
     }
     // An upgrade does nothing until the daemon is restarted: say so, where it will be seen.
     if let Ok(status) = app.conn.call(Command::Status).await {
@@ -1415,6 +1451,65 @@ impl App {
         }
         self.live_view = Some((cmd, Instant::now(), follow));
         self.dirty = true;
+    }
+
+    /// Put a theme in force and keep it: it is written to config.toml, so that it is
+    /// the theme next time too.
+    fn keep_theme(&mut self, name: &str) {
+        theme::set(name);
+        // Only this setting is changed, in the file as it stands now.
+        let kept = Config::load(&self.paths).and_then(|mut cfg| {
+            cfg.tui.theme = name.to_string();
+            cfg.save(&self.paths)
+        });
+        self.cfg.tui.theme = name.to_string();
+        match kept {
+            Ok(()) => self.flash(format!("theme: {name}")),
+            Err(e) => self.error(format!("the theme is {name} for now, but could not be saved: {e:#}")),
+        }
+        self.dirty = true;
+    }
+
+    fn draw_themes(&self, f: &mut Frame, area: Rect, sel: usize, before: &str) {
+        let names = theme::names();
+        let w = 74.min(area.width.saturating_sub(4)).max(30);
+        let h = (names.len() as u16 + 2).min(area.height.saturating_sub(2)).max(5);
+        let rect = Rect { x: area.x + (area.width.saturating_sub(w)) / 2, y: area.y + (area.height.saturating_sub(h)) / 2, width: w.min(area.width), height: h.min(area.height) };
+        let block = UiBlock::bordered()
+            .border_style(Style::new().fg(Color::LightBlue))
+            .title(" theme ")
+            .title_bottom(format!(" ↑↓ try · enter keep · esc back to {before} "));
+        let room = block.inner(rect).height as usize;
+        let offset = sel.saturating_sub(room.saturating_sub(1));
+        let lines: Vec<Line> = names
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(room)
+            .map(|(i, name)| {
+                let on = i == sel;
+                let mut spans = vec![
+                    Span::styled(if on { " ▸ " } else { "   " }, Style::new().fg(Color::LightBlue)),
+                    Span::styled(format!("{name:<17}"), if on { Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD) } else { Style::new() }),
+                ];
+                match theme::find(name) {
+                    Some(t) => {
+                        // Its own colours, on its own ground, whatever theme is in force around it.
+                        let ground = theme::shown(t.bg);
+                        spans.push(Span::styled(" ", Style::new().bg(ground)));
+                        for colour in [t.fg, t.accent, t.red, t.green, t.yellow, t.magenta, t.cyan, t.dim] {
+                            spans.push(Span::styled("● ", Style::new().fg(theme::shown(colour)).bg(ground)));
+                        }
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(t.about, Style::new().fg(Color::DarkGray)));
+                    }
+                    None => spans.push(Span::styled("your terminal's own colours", Style::new().fg(Color::DarkGray))),
+                }
+                Line::from(spans)
+            })
+            .collect();
+        f.render_widget(Clear, rect);
+        f.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
     /// The goal and work panel's key: pop it in and go to it, then pop it out again.
@@ -2285,6 +2380,17 @@ impl App {
                 }
             }
             "/keys" => self.want_keys = true,
+            "/theme" => {
+                let names = theme::names();
+                if arg.is_empty() {
+                    let sel = names.iter().position(|n| *n == theme::current()).unwrap_or(0);
+                    self.overlay = Overlay::Themes { sel, before: theme::current().to_string() };
+                } else if names.contains(&arg.to_lowercase().as_str()) {
+                    self.keep_theme(&arg.to_lowercase());
+                } else {
+                    self.flash(format!("there is no theme called {arg}: /theme lists them"));
+                }
+            }
             "/daemonrestart" => {
                 self.flash("restarting the daemon…");
                 self.want_restart = true;
@@ -2570,6 +2676,31 @@ impl App {
             }
             return;
         }
+        if let Overlay::Themes { sel, before } = &mut self.overlay {
+            // Moving over a theme puts it in force, so the whole screen shows what it would be.
+            let names = theme::names();
+            let last = names.len() - 1;
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1).min(last),
+                KeyCode::Home => *sel = 0,
+                KeyCode::End => *sel = last,
+                KeyCode::Enter => {
+                    let chosen = names[*sel].to_string();
+                    self.overlay = Overlay::None;
+                    self.keep_theme(&chosen);
+                    return;
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    theme::set(before);
+                    self.overlay = Overlay::None;
+                    return;
+                }
+                _ => return,
+            }
+            theme::set(names[*sel]);
+            return;
+        }
         let ctrl_c = code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if self.showing_logs() && !ctrl_c && self.log_key(code) {
             return;
@@ -2644,7 +2775,8 @@ impl App {
                 KeyCode::Enter => self.overlay = Overlay::None,
                 _ => {}
             },
-            Overlay::None => {}
+            // The themes have their keys taken above.
+            Overlay::None | Overlay::Themes { .. } => {}
         }
         if let Some(id) = open {
             self.back_to = None;
@@ -3369,8 +3501,11 @@ impl App {
     }
 
     fn draw_overlay(&self, f: &mut Frame, area: Rect) {
+        if let Overlay::Themes { sel, before } = &self.overlay {
+            return self.draw_themes(f, area, *sel, before);
+        }
         let (title, lines, sel, hint): (String, Vec<String>, Option<usize>, &str) = match &self.overlay {
-            Overlay::None => return,
+            Overlay::None | Overlay::Themes { .. } => return,
             Overlay::Sessions { list, sel } => (
                 "sessions".into(),
                 list.iter()
@@ -3477,19 +3612,18 @@ impl App {
                 if Some(i) == sel {
                     Line::styled(format!(" {text:<w$}", w = inner.width.saturating_sub(1) as usize), Style::new().bg(Color::LightBlue).fg(Color::Black))
                 } else if logs {
-                    // By how serious the line is; a line that continues another keeps its colour.
-                    let level = lines[..=i]
+                    // Each part in its own colour: when, how serious, whose, what happened, and the
+                    // values recorded with it. A line that continues another is read at that line's level.
+                    let level = lines[..i]
                         .iter()
                         .rev()
-                        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
-                        .find_map(|l| ["ERROR", " WARN", "DEBUG", " INFO"].iter().position(|lv| l.get(12..18).is_some_and(|at| at.contains(lv))));
-                    let style = match level {
-                        Some(0) => Style::new().fg(Color::Red),
-                        Some(1) => Style::new().fg(Color::Yellow),
-                        Some(2) => Style::new().fg(Color::DarkGray),
-                        _ => Style::new(),
-                    };
-                    Line::styled(format!(" {text}"), style)
+                        .find(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+                        .map(|l| crate::telemetry::log_parts(l, 1).1)
+                        .unwrap_or(1);
+                    let (parts, _) = crate::telemetry::log_parts(&text, level);
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(parts.into_iter().map(|(part, piece)| Span::styled(piece, log_style(part))));
+                    Line::from(spans)
                 } else if file {
                     // What was put in and taken out, as a diff is read; each step and heading stands out.
                     let style = match l.trim_start().chars().next() {
