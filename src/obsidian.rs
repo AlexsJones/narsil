@@ -586,7 +586,12 @@ impl Vault {
     pub fn resolve(&self, name: &str) -> Result<PathBuf> {
         let target = link_target(name);
         match self.confine(&target) {
-            Ok(path) if path.is_file() => return Ok(path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf()),
+            Ok(path) if path.is_file() => {
+                // As the note is named on disk: where capitals do not matter to the
+                // filesystem (macOS), `house/budget` opens `House/Budget.md`.
+                let named = std::fs::canonicalize(&path).ok().and_then(|p| p.strip_prefix(&self.real_root).ok().map(Path::to_path_buf));
+                return Ok(named.unwrap_or_else(|| path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf()));
+            }
             // Named outright and closed: say so, so the agent stops there.
             Err(e) if e.to_string().contains(CLOSED) => return Err(e),
             _ => {}

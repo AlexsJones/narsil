@@ -68,15 +68,26 @@ pub fn kill_orphan(state: &serde_json::Value) -> bool {
     let (Some(pgid), Some(marker)) = (state["pgid"].as_i64(), state["marker"].as_str()) else {
         return false;
     };
-    let Ok(environ) = std::fs::read(format!("/proc/{pgid}/environ")) else {
-        return false;
-    };
     let needle = format!("NARSIL_CALL={marker}");
-    if !environ.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()) {
+    if !started_with(pgid, &needle) {
         return false;
     }
     unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
     true
+}
+
+/// Whether a process was started with this `NAME=value` in its environment.
+fn started_with(pid: i64, variable: &str) -> bool {
+    // Linux says so directly.
+    if let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) {
+        return environ.split(|b| *b == 0).any(|kv| kv == variable.as_bytes());
+    }
+    // Elsewhere (macOS has no /proc), `ps` prints a process's environment after
+    // its command line, for processes of the same user.
+    let Ok(out) = std::process::Command::new("ps").args(["eww", "-o", "command=", "-p", &pid.to_string()]).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).split_whitespace().any(|word| word == variable)
 }
 
 fn capture<R: AsyncRead + Unpin + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()> {

@@ -38,7 +38,9 @@ jobs:
       # daemon with the scripted model. The tests in tests/live.rs call a real
       # model and are never run here.
       - name: Test
-        run: cargo test --locked
+        # Every test binary runs, even after one has failed: on a platform that
+        # is still being brought up, all of what fails is worth seeing at once.
+        run: cargo test --locked --no-fail-fast
 
   release-config:
     name: release config
