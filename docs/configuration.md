@@ -13,7 +13,8 @@ All under `~/.config/narsil/` (`narsil config path` prints the exact locations):
 | `./AGENTS.md` | Per-project instructions, read from the working directory upward. |
 
 `SOUL.md` and `AGENTS.md` are read when a session's context is built, so edits apply to new sessions
-and after the next compaction. `config.toml` applies after `narsil restart` or `/reload`.
+and after the next compaction. `config.toml` applies after `narsil restart` or `/reload`;
+`narsil setup` restarts a running daemon itself, so what it set up is what is in use.
 
 ## Models
 

@@ -288,9 +288,38 @@ pub async fn run(paths: &Paths, opts: SetupOpts) -> Result<()> {
     if cfg.voice.transcribe_command.is_empty() {
         println!("  voice input: set [voice] transcribe_command in config.toml (e.g. whisper.cpp), then F2 in the TUI");
     }
-    if crate::service::ping(paths).await.is_some() {
-        println!("\nThe daemon is running with the old settings: `narsil restart` to apply the new ones.");
+    apply_to_daemon(paths, interactive).await
+}
+
+/// A daemon that is running still has the old settings, and the environment it
+/// was started in, which may lack a key exported since. Start it again from
+/// here, so that what was just set up is what narsil uses.
+async fn apply_to_daemon(paths: &Paths, interactive: bool) -> Result<()> {
+    let Some(status) = crate::service::ping(paths).await else {
+        return Ok(());
+    };
+    let working = status["running"].as_array().map(|a| a.len()).unwrap_or(0);
+    println!();
+    let restart = !interactive || {
+        let prompt = match working {
+            0 => "The daemon is running with the old settings. Restart it now, so the new ones are in force?".to_string(),
+            n => format!(
+                "The daemon is running with the old settings, and {n} session{} at work (suspended, then picked up again). Restart it now?",
+                if n == 1 { " is" } else { "s are" }
+            ),
+        };
+        Confirm::with_theme(&theme()).with_prompt(prompt).default(true).interact()?
+    };
+    if !restart {
+        println!("The daemon keeps the old settings until `narsil restart` (or /daemonrestart in the TUI).");
+        return Ok(());
     }
+    let launcher = crate::service::program();
+    let restarted = std::process::Command::new(&launcher).arg("restart").status().with_context(|| format!("running {} restart", launcher.display()))?;
+    if !restarted.success() {
+        bail!("the settings were saved, but the daemon did not restart: run `narsil restart`");
+    }
+    println!("The new settings are in force. A TUI that was open has to be opened again (or /daemonrestart in it).");
     Ok(())
 }
 
