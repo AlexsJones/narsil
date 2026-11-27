@@ -471,9 +471,28 @@ pub struct Goal {
     pub iterations: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// What will be true when it is done, a check to a line, as the agent set it out. Empty: not
+    /// said yet. `open`: there is no such end, and it works until it is stopped.
+    #[serde(default)]
+    pub done_when: String,
+    /// When it was last set going again after a pause: budgets count from here.
+    #[serde(default)]
+    pub resumed_at: i64,
 }
 
-const GOAL_COLS: &str = "id, objective, cwd, model, status, note, session_id, iterations, created_at, updated_at";
+impl Goal {
+    /// Whether the agent has said there is no finish line to work to.
+    pub fn open_ended(&self) -> bool {
+        self.done_when == "open"
+    }
+
+    /// When the time and tokens it is allowed began to count.
+    pub fn budget_from(&self) -> i64 {
+        self.created_at.max(self.resumed_at)
+    }
+}
+
+const GOAL_COLS: &str = "id, objective, cwd, model, status, note, session_id, iterations, created_at, updated_at, done_when, resumed_at";
 
 fn goal_from(row: &Row) -> rusqlite::Result<Goal> {
     Ok(Goal {
@@ -487,6 +506,8 @@ fn goal_from(row: &Row) -> rusqlite::Result<Goal> {
         iterations: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        done_when: row.get(10)?,
+        resumed_at: row.get(11)?,
     })
 }
 
@@ -581,6 +602,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("memories", "path", "TEXT"),
         ("memories", "mtime", "INTEGER NOT NULL DEFAULT 0"),
         ("memories", "pending", "INTEGER NOT NULL DEFAULT 0"),
+        ("goals", "done_when", "TEXT NOT NULL DEFAULT ''"),
+        ("goals", "resumed_at", "INTEGER NOT NULL DEFAULT 0"),
     ];
     for (table, column, decl) in added {
         let present: bool = conn
@@ -844,6 +867,11 @@ impl Store {
             params![session],
             |r| r.get(0),
         )?)
+    }
+
+    /// How many tool calls a session has made.
+    pub fn tool_call_count(&self, session: &str) -> Result<i64> {
+        Ok(self.db().query_row("SELECT COUNT(*) FROM tool_calls WHERE session_id = ?1", params![session], |r| r.get(0))?)
     }
 
     /// A tool call by its id: (the tool, what it was called with, what came back, whether that was a failure).
@@ -1449,10 +1477,27 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Write down what a goal is done when (`open`: nothing; it works until stopped).
+    pub fn goal_set_done_when(&self, id: &str, done_when: &str) -> Result<()> {
+        self.db().execute("UPDATE goals SET done_when = ?2, updated_at = ?3 WHERE id = ?1", params![id, done_when, now()])?;
+        Ok(())
+    }
+
+    /// What a session tree has used since a moment (unix seconds): tokens in and out together.
+    pub fn tokens_since(&self, root: &str, since: i64) -> Result<i64> {
+        Ok(self.db().query_row(
+            "SELECT COALESCE(SUM(input + cache_read + cache_write + output), 0) FROM model_usage WHERE root_id = ?1 AND started_ms >= ?2",
+            params![root, since * 1000],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn goal_set_status(&self, id: &str, status: &str, note: &str) -> Result<()> {
+        // Set going again: what it is allowed counts from now.
+        let resumed: Option<i64> = (status == "active").then(now);
         self.db().execute(
-            "UPDATE goals SET status = ?2, note = ?3, updated_at = ?4 WHERE id = ?1",
-            params![id, status, note, now()],
+            "UPDATE goals SET status = ?2, note = ?3, updated_at = ?4, resumed_at = COALESCE(?5, resumed_at) WHERE id = ?1",
+            params![id, status, note, now(), resumed],
         )?;
         self.goal_log(id, "status", &if note.is_empty() { status.to_string() } else { format!("{status}: {note}") })
     }

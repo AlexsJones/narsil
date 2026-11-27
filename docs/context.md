@@ -26,6 +26,17 @@ scatter them (a long run, a compaction, a new session, a subagent), and leave th
 - Reminders (to record a dead end, to take an item before working on it) are a line added to what
   the agent already sees, at the moment they apply, not standing instructions repeated every turn.
 
+## Keeping each request small
+
+Every request to the model carries the whole conversation again, so what goes into it is paid for
+at every later step.
+
+- What a tool gives back is cut in the middle at 12,000 characters (`[context] tool_output_limit`);
+  the agent can ask for the part it needs.
+- Taking a work item gives what it rests on and what memory holds on the subject in brief, not in full.
+- After five small steps in a row, each a request of its own (one `cat`, one `grep`, one `sed -i`),
+  the agent is told to do several at once, and to change files with `edit_file`.
+
 ## The system prompt and compaction
 
 A session's system prompt is assembled once per context epoch from: the harness preamble, `SOUL.md`,

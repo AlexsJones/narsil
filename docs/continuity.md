@@ -50,6 +50,34 @@ while items under it are open, a goal with nothing left but questions for you bl
 starts again by itself once you answer one. Provider outages are retried with backoff for as long as it takes.
 `[notify] command` runs when a goal completes, blocks or pauses.
 
+### Where a goal ends
+
+Before it works on a goal, the agent says where the goal ends (`goal_define`): the checks that will
+hold when it is done, or that there is no such end. "Get the tests passing" has one. "Improve my
+website" does not, and an agent given it will find something more to do for as long as it is let.
+
+So that you can tell which you have started:
+
+- The panel shows the checks under the goal (`done when:`), or `open-ended` in its heading with
+  `∞ no finish line: it works until you stop it`.
+- `narsil goal list` marks it `[open-ended, runs until stopped]`, and a notice says so when the agent
+  declares it.
+- An open-ended goal pauses after an hour (`[goals] open_ended_hours`), so that going on is something
+  you chose: `narsil goal resume <id>` gives it another.
+
+### What a goal is allowed
+
+```toml
+[goals]
+max_hours = 0            # pause after this long; 0: no limit
+max_iterations = 0       # pause after this many turns
+max_tokens = 0           # pause after this many tokens, in and out, subagents included
+open_ended_hours = 1.0   # for a goal with no finish line; 0: never
+```
+
+Each counts from when the goal was started or last resumed, so resuming a goal that ran out gives
+it the same again. A paused goal keeps everything: its plan, its journal, its session.
+
 For work that should continue after you log out, run `narsil service install` and then
 `loginctl enable-linger $USER`.
 

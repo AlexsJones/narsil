@@ -381,7 +381,7 @@ impl Default for ContextConfig {
             compact_at_tokens: 150_000,
             project_files: vec!["AGENTS.md".into()],
             memory_budget_chars: 8000,
-            tool_output_limit: 30_000,
+            tool_output_limit: 12_000,
         }
     }
 }
@@ -396,11 +396,17 @@ pub struct GoalsConfig {
     /// Pause a goal after this many consecutive turns in which the agent used
     /// no tools (it is talking, not working).
     pub stall_limit: i64,
+    /// Pause a goal once it has used this many tokens, in and out together,
+    /// with its subagents. 0: no limit.
+    pub max_tokens: i64,
+    /// Pause a goal that has no finish line (the agent said so) after this
+    /// many hours, so that going on is something you chose. 0: never.
+    pub open_ended_hours: f64,
 }
 
 impl Default for GoalsConfig {
     fn default() -> Self {
-        GoalsConfig { max_iterations: 0, max_hours: 0.0, stall_limit: 3 }
+        GoalsConfig { max_iterations: 0, max_hours: 0.0, stall_limit: 3, max_tokens: 0, open_ended_hours: 1.0 }
     }
 }
 
@@ -701,7 +707,12 @@ pub fn render_config(c: &Config) -> String {
     s.push_str(&format!("max_iterations = {}\n", c.goals.max_iterations));
     s.push_str(&format!("max_hours = {:?}\n", c.goals.max_hours));
     s.push_str("# Pause after this many consecutive turns with no tool use.\n");
-    s.push_str(&format!("stall_limit = {}\n\n", c.goals.stall_limit));
+    s.push_str(&format!("stall_limit = {}\n", c.goals.stall_limit));
+    s.push_str("# Pause a goal once it has used this many tokens, in and out, with its subagents. 0: no limit.\n");
+    s.push_str(&format!("max_tokens = {}\n", c.goals.max_tokens));
+    s.push_str("# A goal with no finish line (the agent says so when it starts) pauses after this many hours,\n");
+    s.push_str("# so that going on is something you chose. Limits count from when it was last resumed. 0: never.\n");
+    s.push_str(&format!("open_ended_hours = {}\n\n", c.goals.open_ended_hours));
 
     s.push_str("[permissions]\n");
     s.push_str("# ask: confirm shell commands and file writes. auto: run without asking.\n");

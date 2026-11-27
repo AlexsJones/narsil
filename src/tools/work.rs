@@ -140,7 +140,7 @@ pub fn work_next(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     let remembered = if recalled.is_empty() {
         String::new()
     } else {
-        format!("\nFrom memory, on this subject (do not retry what failed unless something has changed):\n{}\n", crate::memory::recalled_text(&recalled))
+        format!("\nFrom memory, on this subject (do not retry what failed unless something has changed):\n{}\n", crate::util::truncate_middle(&crate::memory::recalled_text(&recalled), 3000))
     };
     Ok(ToolOutput::ok(format!(
         "You have taken this item.\n\n{}{remembered}\nWhen it is finished, close it with work_done, giving the result, the evidence and what you \

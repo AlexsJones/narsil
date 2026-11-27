@@ -3238,7 +3238,7 @@ impl App {
         let agents = self.my_agents();
         let mut rows = Vec::new();
         if let Some(g) = &self.goal {
-            rows.push(heading(format!("GOAL · {} · turn {}", g.status, g.iterations)));
+            rows.push(heading(format!("GOAL · {} · turn {}{}", g.status, g.iterations, if g.open_ended() { " · open-ended" } else { "" })));
             // Struck through once it is achieved.
             let (mark, style) = if g.status == "completed" { ("✓", dim.add_modifier(Modifier::CROSSED_OUT)) } else { ("◆", Style::new()) };
             let mut goal = row(g.objective.trim().to_string(), mark, style, 0);
@@ -3246,6 +3246,19 @@ impl App {
                 goal.mark_style = Style::new().fg(Color::Green);
             }
             rows.push(goal);
+            // Where it ends, as the agent set it out: or that it does not, and so goes on until stopped.
+            if g.open_ended() && g.status != "completed" {
+                let hours = self.cfg.goals.open_ended_hours;
+                let pause = if hours > 0.0 { format!(", or pauses after {hours} h") } else { String::new() };
+                let mut open = row(format!("no finish line: it works until you stop it (/pause){pause}"), "∞", Style::new().fg(Color::Yellow), 0);
+                open.mark_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                rows.push(open);
+            } else if !g.done_when.is_empty() && !g.open_ended() {
+                rows.push(row("done when:".to_string(), " ", dim, 0));
+                for check in g.done_when.lines() {
+                    rows.push(row(check.to_string(), if g.status == "completed" { "✓" } else { "□" }, dim, 0));
+                }
+            }
         }
         // What was asked for in passing is the objective until the next thing is asked: shown while
         // it is worked on, struck through when it is done. A plan laid out under it says the same

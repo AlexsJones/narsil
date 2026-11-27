@@ -113,6 +113,8 @@ pub struct Engine {
     unplanned: Mutex<HashMap<String, u32>>,
     /// The kinds of credential, and the credential stores, a session has already been told how to handle.
     handled: Mutex<HashMap<String, HashSet<String>>>,
+    /// How many small looks and one-line edits a session has made one after another, a request each.
+    piecemeal: Mutex<HashMap<String, u32>>,
     /// Models asked for while a session was in the middle of a turn: taken up at its next step.
     pending_models: Mutex<HashMap<String, String>>,
     shutting_down: AtomicBool,
@@ -311,6 +313,7 @@ impl Engine {
             stumbles: Mutex::new(HashMap::new()),
             unplanned: Mutex::new(HashMap::new()),
             handled: Mutex::new(HashMap::new()),
+            piecemeal: Mutex::new(HashMap::new()),
             pending_models: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         })
@@ -739,6 +742,52 @@ impl Engine {
     /// saying to lay the work out. A request such as "build me a game" deserves
     /// the same steps, visible in the panel and safe against interruption, as
     /// one given as a goal; a one-file fix does not, and never sees this.
+    /// One small thing per request is the slow way to work: each request carries the whole
+    /// conversation again. After a run of them, say so once, and again only after another run.
+    /// A goal that has not yet said where it ends is reminded here too.
+    fn pace_reminder(&self, session: &Session, call: &ToolCall, alone: bool) -> Option<String> {
+        const RUN: u32 = 5;
+        let mut said = String::new();
+        if let Some(goal) = session.goal_id.as_deref().filter(|_| call.name != "goal_define").and_then(|g| self.store.goal_get(g).ok().flatten()) {
+            let calls = self.store.tool_call_count(&session.id).unwrap_or(0);
+            if goal.done_when.is_empty() && calls >= 3 && calls % 6 == 3 {
+                said.push_str(
+                    "\n\n[narsil] This goal has not said where it ends. Call goal_define now: the checks that will hold when it \
+                     is done, or open_ended if the objective names no end.",
+                );
+            }
+        }
+        let command = call.input["command"].as_str().unwrap_or("");
+        let small = match call.name.as_str() {
+            "bash" => {
+                let kind = command_kind(command).unwrap_or_default();
+                let edits = kind == "sed" && command.contains(" -i") || command.contains("<<") && !command.contains("npm ") && command.len() < 4000;
+                let looks = matches!(kind.as_str(), "sed" | "cat" | "grep" | "rg" | "head" | "tail" | "ls" | "wc" | "find") && !command.contains("&&") && !command.contains(';');
+                (looks || edits).then_some(if edits { "edit" } else { "look" })
+            }
+            "read_file" | "grep" | "glob" | "list_dir" => Some("look"),
+            _ => None,
+        };
+        let mut counts = self.piecemeal.lock().unwrap_or_else(|e| e.into_inner());
+        let n = counts.entry(session.id.clone()).or_insert(0);
+        match small.filter(|_| alone) {
+            None => *n = 0,
+            Some(kind) => {
+                *n += 1;
+                if *n == RUN {
+                    *n = 0;
+                    said.push_str(&format!(
+                        "\n\n[narsil] That is {RUN} small steps in a row, each a request of its own that carries the whole conversation \
+                         again. Do several at once: ask for more than one tool in the same reply, or put the commands in one \
+                         (`cmd1; cmd2; cmd3`).{}",
+                        if kind == "edit" { " To change a file, edit_file makes the change in one step and shows it; sed and heredocs are easy to get wrong." } else { "" }
+                    ));
+                }
+            }
+        }
+        (!said.is_empty()).then_some(said)
+    }
+
     fn plan_reminder(&self, session: &Session, tool: &str) -> Option<String> {
         const FILES: u32 = 3;
         if session.parent_id.is_some() {
@@ -896,6 +945,22 @@ impl Engine {
         if let Err(e) = crate::obsidian::write_goal_note(&self.store, &vault, &goal) {
             tracing::warn!(goal = %goal_id, "could not write the goal's note in the vault: {e:#}");
         }
+    }
+
+    /// A goal has said where it ends, or that it does not: everything showing it is told.
+    pub fn goal_defined(&self, id: &str) {
+        self.write_goal_note(id);
+        let Ok(Some(goal)) = self.store.goal_get(id) else { return };
+        if goal.open_ended() {
+            let hours = self.cfg().goals.open_ended_hours;
+            let pause = if hours > 0.0 { format!(" It pauses after {hours} h for you to decide.") } else { String::new() };
+            tracing::info!(goal = %id, "the goal is open-ended");
+            if let Some(session) = goal.session_id.as_deref().and_then(|s| self.store.get_session(s).ok().flatten()) {
+                let text = format!("this goal has no finish line: it keeps working until you stop it (/pause).{pause}");
+                self.emit(&session, Event::Notice { level: "warn".into(), text });
+            }
+        }
+        self.emit_global(Event::Goal { goal });
     }
 
     pub fn set_goal_status(&self, id: &str, status: &str, note: &str) -> Result<()> {
@@ -1279,6 +1344,8 @@ impl Engine {
         let cfg = self.cfg();
         let sid = &s0.id;
         let calls = self.store.tool_calls(sid, mid)?;
+        // Whether the model asked for one thing only in this reply.
+        let alone = calls.len() == 1;
         let mut ran = 0;
         for call in &calls {
             if call.status == "done" {
@@ -1353,6 +1420,9 @@ impl Engine {
                 out.content.push_str(&reminder);
             }
             if let Some(reminder) = self.plan_reminder(&session, &call.name).filter(|_| !out.is_error) {
+                out.content.push_str(&reminder);
+            }
+            if let Some(reminder) = self.pace_reminder(&session, &call, alone) {
                 out.content.push_str(&reminder);
             }
             span.record("is_error", out.is_error).record("ok", !out.is_error).record("output_bytes", out.content.len() as u64);

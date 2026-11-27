@@ -165,9 +165,30 @@ async fn drive(engine: &Arc<Engine>, goal_id: &str, cancel: &CancellationToken) 
             engine.set_goal_status(goal_id, "paused", &format!("turn budget reached ({} turns)", goal.iterations))?;
             return Ok(());
         }
-        if cfg.goals.max_hours > 0.0 && (now() - goal.created_at) as f64 > cfg.goals.max_hours * 3600.0 {
+        // What it is allowed counts from when it was last set going, so that resuming a goal
+        // that ran out gives it the same again.
+        let ran = (now() - goal.budget_from()) as f64;
+        if cfg.goals.max_hours > 0.0 && ran > cfg.goals.max_hours * 3600.0 {
             engine.set_goal_status(goal_id, "paused", &format!("time budget reached ({} h)", cfg.goals.max_hours))?;
             return Ok(());
+        }
+        if goal.open_ended() && cfg.goals.open_ended_hours > 0.0 && ran > cfg.goals.open_ended_hours * 3600.0 {
+            let note = format!(
+                "this objective has no finish line, and it has worked for {} h: resume it to let it go on, or give it a goal with an end",
+                cfg.goals.open_ended_hours
+            );
+            engine.set_goal_status(goal_id, "paused", &note)?;
+            return Ok(());
+        }
+        if cfg.goals.max_tokens > 0 {
+            if let Some(sid) = &goal.session_id {
+                let used = engine.store.tokens_since(sid, goal.budget_from()).unwrap_or(0);
+                if used >= cfg.goals.max_tokens {
+                    let note = format!("token budget reached ({} of {})", crate::util::fmt_tokens(used), crate::util::fmt_tokens(cfg.goals.max_tokens));
+                    engine.set_goal_status(goal_id, "paused", &note)?;
+                    return Ok(());
+                }
+            }
         }
         let sid = ensure_session(engine, &goal)?;
         if engine.is_running(&sid) {

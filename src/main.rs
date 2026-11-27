@@ -808,7 +808,7 @@ async fn cmd_goal(paths: &Paths, cmd: GoalCmd) -> Result<()> {
                     g.status,
                     g.iterations,
                     fmt_age(g.created_at),
-                    first_line(&g.objective, 70)
+                    first_line(&format!("{}{}", if g.open_ended() { "[open-ended, runs until stopped] " } else { "" }, g.objective), 90)
                 );
             }
             if service::ping(paths).await.is_none() {

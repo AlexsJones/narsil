@@ -346,7 +346,10 @@ pub fn goal_brief(goal_id: &str, objective: &str) -> String {
     format!(
         "[narsil goal {goal_id}] Work on this objective autonomously until it is achieved and verified.\n\n\
          ## Objective\n{}\n\n\
-         Start now. Record milestones with goal_update, finish with goal_complete, and use goal_blocked \
+         First call goal_define: say what will be true when this is done, as checks you can make. If the \
+         objective names no end to reach (improve, polish, explore, keep an eye on), say that it is \
+         open-ended instead of inventing one: the user is then shown that it runs until stopped.\n\
+         Then start. Record milestones with goal_update, finish with goal_complete, and use goal_blocked \
          only for something the user alone can resolve.",
         objective.trim()
     )

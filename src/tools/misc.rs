@@ -159,6 +159,27 @@ pub fn goal_tool(ctx: &ToolCtx<'_>) -> Result<ToolOutput> {
     };
     let input = &ctx.call.input;
     match ctx.call.name.as_str() {
+        "goal_define" => {
+            let checks: Vec<String> = input["done_when"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .unwrap_or_default();
+            let open = input["open_ended"] == true || checks.is_empty();
+            ctx.engine.store.goal_set_done_when(goal_id, &if open { "open".to_string() } else { checks.join("\n") })?;
+            ctx.engine.store.goal_log(goal_id, "progress", &if open { "open-ended: no finish line".to_string() } else { format!("done when: {}", checks.join("; ")) })?;
+            ctx.engine.goal_defined(goal_id);
+            let hours = ctx.cfg.goals.open_ended_hours;
+            Ok(ToolOutput::ok(match open {
+                true if hours > 0.0 => format!(
+                    "Recorded as open-ended: the user is shown that this runs until stopped, and it will be paused after {hours} h \
+                     for them to decide whether it goes on. Work on what matters most first, and record each thing finished with goal_update."
+                ),
+                true => "Recorded as open-ended: the user is shown that this runs until stopped. Work on what matters most first, \
+                         and record each thing finished with goal_update."
+                    .to_string(),
+                false => format!("Recorded. The goal is done when: {}. Call goal_complete once every one of them holds.", checks.join("; ")),
+            }))
+        }
         "goal_update" => {
             let note = str_arg(input, "note")?.trim();
             ctx.engine.store.goal_log(goal_id, "progress", note)?;

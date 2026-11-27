@@ -439,6 +439,19 @@ pub fn specs(session: &Session, cfg: &Config) -> Vec<ToolSpec> {
     }
     if session.kind == "goal" {
         v.push(spec(
+            "goal_define",
+            "Say where this goal ends, before working on it. `done_when` is what will be true when it is \
+             done, as checks you can make (a command that passes, a page that exists, a number reached). If \
+             the objective names no end to reach, set `open_ended` and leave `done_when` empty: do not make \
+             an end up. The user is shown which it is, and an open-ended goal is paused after a while so \
+             that going on is their choice. Call it again if what done means changes.",
+            json!({
+                "open_ended": { "type": "boolean", "description": "True when nothing in the objective says when to stop." },
+                "done_when": { "type": "array", "items": { "type": "string" }, "description": "The checks that will hold when it is done. Empty when open-ended." }
+            }),
+            &["open_ended", "done_when"],
+        ));
+        v.push(spec(
             "goal_update",
             "Record a milestone or important finding in the goal's progress journal. These entries survive \
              context compaction and restarts, and are shown to you when you resume. Call it whenever \
@@ -551,6 +564,10 @@ pub fn summarize_call(name: &str, input: &Value) -> String {
         },
         "work_done" => format!("{}: {}", s("item"), first_line(s("result"), 120)),
         "work_update" => format!("{}{}", s("item"), if s("status").is_empty() { String::new() } else { format!(" -> {}", s("status")) }),
+        "goal_define" => match input["open_ended"] == true {
+            true => "open-ended".to_string(),
+            false => format!("done when: {}", first_line(&input["done_when"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default(), 180)),
+        },
         "goal_update" => first_line(s("note"), 200),
         "goal_complete" => first_line(s("summary"), 200),
         "goal_blocked" => first_line(s("reason"), 200),
@@ -622,7 +639,7 @@ pub async fn execute(ctx: &ToolCtx<'_>) -> ToolOutput {
         "work_next" => work::work_next(ctx),
         "work_done" => work::work_done(ctx),
         "work_update" => work::work_update(ctx),
-        "goal_update" | "goal_complete" | "goal_blocked" => misc::goal_tool(ctx),
+        "goal_define" | "goal_update" | "goal_complete" | "goal_blocked" => misc::goal_tool(ctx),
         other => Ok(ToolOutput::err(format!("unknown tool: {other}"))),
     };
     let mut out = result.unwrap_or_else(|e| ToolOutput::err(format!("{e:#}")));

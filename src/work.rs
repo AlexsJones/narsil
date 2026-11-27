@@ -786,7 +786,8 @@ impl Overview {
             out.push_str("\nIt rests on:\n");
             for b in inputs {
                 let result = if b.result.trim().is_empty() { format!("({})", b.status.replace('_', " ")) } else { b.result.trim().to_string() };
-                out.push_str(&format!("- {}: {result}\n", b.title));
+                // Enough to know what was done; the item's own note has the whole of it.
+                out.push_str(&format!("- {}: {}\n", b.title, crate::util::truncate_middle(&result, 500)));
             }
         }
         if !item.log.trim().is_empty() {
