@@ -1,0 +1,8 @@
+[project]
+name = "tideline"
+version = "0.3.0"
+description = "Tide times for a harbour, in your terminal"
+requires-python = ">=3.11"
+
+[project.scripts]
+tideline = "tideline.cli:main"

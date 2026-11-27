@@ -1,5 +1,9 @@
 # Work and subagents
 
+<p align="center"><img src="img/overview.png" alt="A request being worked on: the plan on the right, with one item done and two held by subagents" width="880"></p>
+
+<p align="center"><sub>The plan for a request, on the right: one item done and struck through, two in the hands of subagents working at once.</sub></p>
+
 ## The work graph
 
 Work that takes more than a couple of steps is laid out as items that depend on each other, and that

@@ -46,6 +46,10 @@ second half; the TUI and `narsil status` say when the daemon is older than the p
 
 ## Commands
 
+<p align="center"><img src="img/run.png" alt="narsil run in a shell: the steps it took, the answer, and what it used" width="880"></p>
+
+<p align="center"><sub>One prompt from the shell: the steps, the answer, what it used, and how to go back to the session.</sub></p>
+
 ```sh
 narsil start | stop | restart | status     # the daemon (the TUI starts it on demand)
 narsil update [--check]                    # update narsil and restart the daemon

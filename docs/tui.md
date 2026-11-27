@@ -3,6 +3,10 @@
 The screen is the conversation, with two panels that pop in and out beside it: the goal and its work
 on the right, the file explorer on the left.
 
+<p align="center"><img src="img/overview.png" alt="narsil at work: the file explorer, the conversation, and the objective with its plan and two subagents" width="880"></p>
+
+<p align="center"><sub>A request being worked on. Left, the files it has made (+), changed (~) and read (○). Right, the plan: one item done, two held by subagents.</sub></p>
+
 ## Keys
 
 Every key in this table can be changed: see [Changing the keys](#changing-the-keys).
@@ -46,6 +50,10 @@ A binding is modifiers (`ctrl`, `alt`, `shift`) and a key, joined by `+`: a lett
 `backspace`, `delete`, `insert`, `f1` to `f12`. `/reload` does not re-read keys: they are read when
 the TUI starts. A binding that cannot be read keeps its default and is reported when the TUI opens,
 as is a key bound to two actions. The keys window (`f1`, or `/keys`) always shows what is in force.
+
+<p align="center"><img src="img/keys.png" alt="The keys window: each key, what it does, and its name in the configuration" width="880"></p>
+
+<p align="center"><sub>The keys window, with the name each binding has in <code>[keys]</code>.</sub></p>
 
 Going to a tab by number takes two keystrokes because terminals keep the one-stroke versions for
 themselves: Ptyxis, GNOME Terminal and Ghostty all use alt+1…9 for their own tabs.
@@ -100,6 +108,10 @@ Enter on a file opens a window on **what narsil has done to that file**: each re
 latest first, with what an edit took out and put in, and below that what stands changed in the file
 against git. From there enter goes to that step in the conversation, and esc closes the window.
 
+<p align="center"><img src="img/file-history.png" alt="What narsil did to one file: each read and edit with what was taken out and put in, and the change not yet committed" width="880"></p>
+
+<p align="center"><sub>Enter on a file: every read and edit narsil made to it, latest first, and what stands uncommitted.</sub></p>
+
 ## Tokens
 
 When a request is done, a line under it says what it used: the calls to the model, the tokens in
@@ -108,11 +120,19 @@ keeps the running total for the session and its subagents, as `↑in ↓out`. `/
 account: by request, by model, and what a call carries now. A `~` marks a figure that is partly
 narsil's estimate. [Observability](observability.md#tokens) says how the figures are arrived at.
 
+<p align="center"><img src="img/usage.png" alt="The usage window: tokens for the session and its subagents, what a call carries, and each request" width="880"></p>
+
+<p align="center"><sub><code>/usage</code>. Behind it, the line under each request saying what it used; bottom right, the running total.</sub></p>
+
 ## Themes
 
 `/theme` opens the list of colour themes. Moving over one puts it in force, so the whole screen shows
 what it would be; enter keeps it, esc goes back to the one you had. The choice is saved as `theme`
 under `[tui]` in `config.toml`, and `/theme gruvbox` sets one directly.
+
+<p align="center"><img src="img/themes.png" alt="The theme picker, with a row of colours for each theme" width="880"></p>
+
+<p align="center"><sub><code>/theme</code>: each theme with its colours. The one under the cursor is in force as you move.</sub></p>
 
 | Theme | |
 | --- | --- |

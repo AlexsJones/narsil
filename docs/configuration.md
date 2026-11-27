@@ -30,6 +30,10 @@ longer replayed. From the shell: `narsil run --session <id> --model <provider/mo
 
 ## Permissions and sudo
 
+<p align="center"><img src="img/approval.png" alt="narsil asking before it runs a shell command: allow, always allow in this session, or deny" width="880"></p>
+
+<p align="center"><sub>In <code>ask</code> mode, a command waits for you: <code>y</code> once, <code>a</code> for the rest of the session, <code>n</code> to refuse.</sub></p>
+
 - `[permissions] mode = "ask"` confirms shell commands and file writes in interactive sessions;
   `"auto"` never asks. Goals use `goal_mode`, `"auto"` by default, because nobody is there to answer.
   `allow` lists simple commands that never ask; `deny` lists substrings that are always refused.

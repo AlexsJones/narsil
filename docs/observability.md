@@ -8,6 +8,12 @@ inside, and its details (tokens, time to the first token, the provider's request
 narsil trace              # the latest session; or: narsil trace <session or goal id>
 ```
 
+<p align="center"><img src="img/trace.png" alt="The trace of a session: each decision of the model, the tool call it led to, and a subagent's steps nested under the call that started it" width="880"></p>
+
+<p align="center"><sub><code>/trace</code> in the TUI: the same tree, live. A subagent's steps hang under the call that started it.</sub></p>
+
+As text:
+
 ```
 ● session c3hb › “Count the lines in one.txt and two.txt, then tell me the total.”      1.29s
 ├─ ◆ decides what to do next  [claude-haiku-5-5 · 4.8k in, 57 out]                      669ms
@@ -59,6 +65,10 @@ the tokens the backend said it used. Three views show it.
 what was read from the backend's cache, what was written to it, and what was neither. The share that
 was read from cache is the percentage shown.
 
+<p align="center"><img src="img/usage.png" alt="The usage window: tokens for the session and its subagents, what a call carries, and each request" width="880"></p>
+
+<p align="center"><sub><code>/usage</code></sub></p>
+
 **What a call carries now** is the size the backend last reported for the conversation, shared out
 among instructions, tool definitions, memory and work, conversation, and tool results. The size is
 the backend's; the shares are estimated from the length of each part. Instructions and tools are
@@ -66,18 +76,22 @@ what narsil itself adds to every call.
 
 ### How far the figures can be trusted
 
-They are the backend's own, read as each backend reports them, and they differ:
+They are the backend's own, read as each backend reports them, and backends differ in what they say:
 
 | Backend | Read from cache | Written to cache | Reasoning |
 | --- | --- | --- | --- |
 | Anthropic | reported | reported | in the output |
 | OpenAI, DeepSeek, Mistral, Groq | reported | not reported apart | in the output |
 | OpenRouter | reported | reported, for models that charge for it | in the output |
-| xAI, Gemini | reported | not reported apart | counted by narsil from the total, since these leave it out of the output figure |
+| xAI | reported | not reported apart | left out of the output figure, so narsil takes it from the total |
+| Gemini (OpenAI endpoint) | not documented | not documented | reported by users as left out of the output figure; taken from the total where the total says so |
 | llama.cpp | reported (from the server's timings on older builds) | none | in the output |
-| Ollama | from 0.33.3 | none | in the output |
+| Ollama | in recent versions | none | in the output |
 | vLLM | reported, when the server is started to say | reported | in the output |
-| LM Studio | not reported | none | in the output |
+| LM Studio | not documented | none | in the output |
+
+Where a backend does not say how much was read from cache, the cached share shows as 0%, which
+means "not reported", not "nothing was cached".
 
 A figure with `~` before it is partly narsil's own estimate, made from the length of the text. That
 happens in two cases: a server that reports no usage at all, and a server that reports a prompt far
@@ -125,6 +139,10 @@ In the TUI, `/logs` opens the log in a window: this session's lines, with its su
 as they are written. `e` shows errors only, `w` warnings and errors, `i` info and up, `a` everything;
 `s` switches between this session and all of them; `/` finds text; `f` goes back to following.
 Long lines are wrapped in full; `l` cuts them off at the edge instead, one line each.
+
+<p align="center"><img src="img/logs.png" alt="The log window, each line naming its session and subagent" width="880"></p>
+
+<p align="center"><sub><code>/logs</code>: every line says whose it is, a subagent as <code>session&gt;subagent name</code>.</sub></p>
 Each part of a line has its own colour: the time and the names of recorded values recede, the level
 is green, yellow or red by how serious it is, the session id, a subagent's name and a goal's id each
 stand out differently, and a line that reports trouble is tinted as a whole. `narsil logs` shows the

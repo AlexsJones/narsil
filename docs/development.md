@@ -65,6 +65,17 @@ against.
 has no llmfit unless the test gives it one, so the suite is the same on a machine with llmfit
 installed and on one without.
 
+## Screenshots
+
+The screenshots in these pages are made by `docs/screenshots/make.sh`. It walks a scripted session
+through the TUI in tmux and draws each screen to a PNG from what the terminal holds, so they can be
+remade whenever the interface changes. No model is called: the `mock` provider follows
+`docs/screenshots/script.py`, working in a copy of the small project in `docs/screenshots/tideline/`.
+
+```sh
+cargo build && docs/screenshots/make.sh        # needs tmux, git, python3 with Pillow, fontconfig
+```
+
 ## Releasing
 
 The git tag is the version. Pushing one releases it:
