@@ -2,6 +2,10 @@
 
 <p align="center">Just enough harness. A daemon that runs your agents, and a terminal UI that attaches to it.</p>
 
+```sh
+brew install AlexsJones/narsil/narsil && narsil setup
+```
+
 <p align="center">
   <img src="assets/screenshot.png" alt="narsil in a terminal: a file explorer on the left showing which files the agent has read, the conversation in the middle with the commands it is running, the objective it is working on to the right, and the colour theme picker open over them" width="920">
 </p>
