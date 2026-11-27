@@ -318,6 +318,17 @@ decisions together with the reasons for them.
 5. Facts about this environment or project that you had to discover.
 Do not call any tools. Reply with the handoff only.";
 
+/// Where in a system prompt the part that narsil keeps (memory, task notes,
+/// the state of the work, the goal) begins: everything before it is
+/// instructions. The length of the prompt when there is no such part.
+pub fn memory_starts(system: &str) -> usize {
+    ["\n# Memory\n", "\n# Task notes (shared by every agent on this task)\n", "\n# Work in this project\n", "\n# Done before, in other directories\n", "\n# Goal "]
+        .iter()
+        .filter_map(|heading| system.find(heading))
+        .min()
+        .unwrap_or(system.len())
+}
+
 pub fn compaction_message(summary: &str, last_user_text: Option<&str>) -> String {
     let mut s = String::from(
         "[narsil] The earlier part of this conversation was compacted. This is the handoff you wrote:\n\n",

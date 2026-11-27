@@ -20,6 +20,7 @@ mod tools;
 mod tui;
 mod types;
 mod update;
+mod usage;
 mod util;
 mod voice;
 mod work;
@@ -139,6 +140,14 @@ enum Cmd {
         #[arg(long)]
         folded: bool,
         /// Print the recorded spans as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tokens a session and its subagents used: in and out, cached, by request and by model
+    Usage {
+        /// A session or goal id (default: whatever used a model most recently)
+        id: Option<String>,
+        /// The numbers for a program to read
         #[arg(long)]
         json: bool,
     },
@@ -380,6 +389,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cmd_trace(&paths, id, TraceOut { timeline, flamegraph, chrome, folded, json })
         }
         Some(Cmd::Stats { since }) => cmd_stats(&paths, &since),
+        Some(Cmd::Usage { id, json }) => cmd_usage(&paths, id, json),
         Some(Cmd::Work { clear: true, .. }) => {
             let conn = client::Conn::connect_or_start(&paths).await?;
             let said = conn.call(proto::Command::WorkClear { cwd: cwd()? }).await?;
@@ -650,9 +660,21 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<()> {
         }
         out.flush()?;
     }
+    // What this request used, as the backend counted it: the same line the TUI puts under a request.
+    let used = open_store(paths).ok().and_then(|store| {
+        let root = store.get_session(&sid).ok().flatten()?.root_id;
+        usage::receipts(&store, &root).pop().map(|(_, tokens)| usage::receipt_line(&tokens))
+    });
     if pretty {
-        eprintln!("\n{}", runview::footer(&sid, colour));
+        eprintln!();
+        if let Some(used) = &used {
+            eprintln!("{}", runview::receipt(used, colour));
+        }
+        eprintln!("{}", runview::footer(&sid, colour));
     } else {
+        if let Some(used) = &used {
+            eprintln!("({used})");
+        }
         // Scripts read this line for the session's id.
         eprintln!("(session {sid})");
     }
@@ -1153,6 +1175,25 @@ fn trace_root(store: &Store, id: Option<&str>) -> Result<String> {
             Ok(store.require_session(&store.resolve_session(id)?)?.root_id)
         }
     }
+}
+
+fn cmd_usage(paths: &Paths, id: Option<String>, as_json: bool) -> Result<()> {
+    let store = open_store(paths)?;
+    let root = match &id {
+        Some(_) => trace_root(&store, id.as_deref())?,
+        None => store.latest_usage_root()?.ok_or_else(|| anyhow!("no request to a model has been recorded yet"))?,
+    };
+    let session = store.require_session(&root)?;
+    let report = usage::report(&store, &Config::load(paths)?, &session)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&usage::json(&report))?);
+        return Ok(());
+    }
+    let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(90).clamp(60, 100);
+    println!("session {root}  {}", first_line(&session.title, 60));
+    println!();
+    usage::lines(&report, width).iter().for_each(|l| println!("{l}"));
+    Ok(())
 }
 
 fn cmd_trace(paths: &Paths, id: Option<String>, out: TraceOut) -> Result<()> {

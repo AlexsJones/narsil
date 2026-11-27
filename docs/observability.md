@@ -29,11 +29,67 @@ the same inside the TUI.
 | `narsil trace --chrome out.json` | A trace for ui.perfetto.dev, one track per session |
 | `narsil trace --folded` / `--json` | Folded stacks for other flamegraph tools; the raw records |
 | `narsil stats --since 7d` | Totals over a period, per model and per tool; `/stats` in the TUI |
+| `narsil usage [id]` | Tokens a session and its subagents used, by request and by model; `/usage` in the TUI |
 | `narsil status` | What is in flight this moment: which session is in which model call or tool |
 | `narsil logs -f` | The daemon log; `--session <id>` for one session or goal |
 
 Because a step is recorded when it starts, not when it ends, whatever was running when the daemon
 was killed is on record, and shows in the trace as cut off with how long it had run.
+
+## Tokens
+
+What a session used is counted from one record: every request to a model that was answered, with
+the tokens the backend said it used. Three views show it.
+
+- **A receipt under each request**, once it is done, in the TUI and at the end of `narsil run`:
+
+  ```
+  ∑ 12 calls · 184.0k in (93% cached) · 3.1k out · 1m 42s
+  ```
+
+  The subagents that worked on the request are counted in it. The time is from the first call to the
+  end of the last, tools and approvals included.
+- **A running total in the status bar**: `↑368.0k ↓12.2k`, in and out, for the session and its
+  subagents.
+- **`/usage`** (and `narsil usage [id]`, with `--json` for a program): the session and its subagents
+  apart and together, by model where more than one was used, by request, and what a call to the
+  model carries now.
+
+"In" is everything that was sent. A bill is made of three parts of it, which `/usage` gives apart:
+what was read from the backend's cache, what was written to it, and what was neither. The share that
+was read from cache is the percentage shown.
+
+**What a call carries now** is the size the backend last reported for the conversation, shared out
+among instructions, tool definitions, memory and work, conversation, and tool results. The size is
+the backend's; the shares are estimated from the length of each part. Instructions and tools are
+what narsil itself adds to every call.
+
+### How far the figures can be trusted
+
+They are the backend's own, read as each backend reports them, and they differ:
+
+| Backend | Read from cache | Written to cache | Reasoning |
+| --- | --- | --- | --- |
+| Anthropic | reported | reported | in the output |
+| OpenAI, DeepSeek, Mistral, Groq | reported | not reported apart | in the output |
+| OpenRouter | reported | reported, for models that charge for it | in the output |
+| xAI, Gemini | reported | not reported apart | counted by narsil from the total, since these leave it out of the output figure |
+| llama.cpp | reported (from the server's timings on older builds) | none | in the output |
+| Ollama | from 0.33.3 | none | in the output |
+| vLLM | reported, when the server is started to say | reported | in the output |
+| LM Studio | not reported | none | in the output |
+
+A figure with `~` before it is partly narsil's own estimate, made from the length of the text. That
+happens in two cases: a server that reports no usage at all, and a server that reports a prompt far
+smaller than it can have been, having counted only the part it had not cached (Ollama has done this
+in several versions). In the second case narsil puts back what was left out, as read from cache.
+
+Not counted: a request that failed or was interrupted before the backend said what it used.
+
+Checked against the real thing with `tests/accuracy.rs` (see [Development](development.md)):
+Anthropic, DeepSeek, llama.cpp and Ollama, call for call against what each sent, with Anthropic's own
+token counter and llama.cpp's tokenizer agreeing on the size of every prompt. The others are held to
+the shapes their documentation gives.
 
 ## One id finds everything
 

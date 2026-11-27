@@ -77,6 +77,12 @@ impl Narsil {
         Narsil::set_up(&["--provider", "mock"], adjust)
     }
 
+    /// A fresh instance set up for the backend these arguments to `narsil setup` name
+    /// (`--provider custom --base-url … --model …`).
+    pub fn with_backend(backend: &[&str], adjust: impl FnOnce(&Path, &mut Config)) -> Narsil {
+        Narsil::set_up(backend, adjust)
+    }
+
     /// A fresh instance that talks to a real model, named by the environment:
     /// NARSIL_LIVE_PROVIDER (a setup preset such as `anthropic` or `deepseek`),
     /// NARSIL_LIVE_MODEL, and NARSIL_LIVE_KEY_ENV (the name of the variable
@@ -445,4 +451,153 @@ impl Config {
 /// A script for the mock model: the steps, joined the way it reads them.
 pub fn script(steps: &[&str]) -> String {
     steps.join(" ;; ")
+}
+
+/// A recorder that stands between narsil and a backend: it passes each request
+/// on to `upstream` and each answer back as it streams, and keeps both. A test
+/// can then read for itself what the backend said, and hold narsil to it.
+pub struct Wire {
+    pub port: u16,
+    dir: PathBuf,
+}
+
+/// One request that went through a `Wire`, and what came back.
+pub struct Exchange {
+    pub path: String,
+    pub request: serde_json::Value,
+    pub status: u16,
+    pub response: String,
+}
+
+impl Drop for Wire {
+    fn drop(&mut self) {
+        // What was recorded is kept only if the test failed, to be looked at.
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+impl Wire {
+    /// Record everything sent to `upstream` (an origin, such as `https://api.example.com`).
+    pub fn to(upstream: &str) -> Wire {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("narsil-wire-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (upstream, kept) = (upstream.trim_end_matches('/').to_string(), dir.clone());
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let client = reqwest::Client::new();
+                let count = std::sync::Arc::new(AtomicUsize::new(0));
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else { continue };
+                    let (client, upstream, kept, count) = (client.clone(), upstream.clone(), kept.clone(), count.clone());
+                    tokio::spawn(async move {
+                        // The request: its head, then as much body as it says there is.
+                        let mut raw = Vec::new();
+                        let mut buf = vec![0u8; 65536];
+                        let head_end = loop {
+                            match socket.read(&mut buf).await {
+                                Ok(read) if read > 0 => raw.extend_from_slice(&buf[..read]),
+                                _ => return,
+                            }
+                            if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break at;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+                        let mut lines = head.lines();
+                        let mut first = lines.next().unwrap_or("").split_whitespace();
+                        let (method, path) = (first.next().unwrap_or("GET").to_string(), first.next().unwrap_or("/").to_string());
+                        let headers: Vec<(String, String)> =
+                            lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string())).collect();
+                        let length = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(0);
+                        while raw.len() < head_end + 4 + length {
+                            match socket.read(&mut buf).await {
+                                Ok(read) if read > 0 => raw.extend_from_slice(&buf[..read]),
+                                _ => return,
+                            }
+                        }
+                        let body = raw[head_end + 4..head_end + 4 + length].to_vec();
+                        let number = count.fetch_add(1, Ordering::SeqCst);
+
+                        // Passed on as it came, but for what belongs to this hop.
+                        let mut forward = client.request(method.parse().unwrap_or(reqwest::Method::GET), format!("{upstream}{path}"));
+                        for (name, value) in &headers {
+                            if !matches!(name.as_str(), "host" | "content-length" | "connection" | "accept-encoding" | "transfer-encoding") {
+                                forward = forward.header(name, value);
+                            }
+                        }
+                        let (status, kind, retry, answer) = match forward.body(body.clone()).send().await {
+                            Ok(mut resp) => {
+                                let status = resp.status().as_u16();
+                                let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+                                let (kind, retry) = (header("content-type").unwrap_or_else(|| "application/json".into()), header("retry-after"));
+                                let mut head = format!("HTTP/1.1 {status} Passed on\r\ncontent-type: {kind}\r\nconnection: close\r\n");
+                                if let Some(retry) = &retry {
+                                    head.push_str(&format!("retry-after: {retry}\r\n"));
+                                }
+                                head.push_str("\r\n");
+                                let _ = socket.write_all(head.as_bytes()).await;
+                                let mut answer = Vec::new();
+                                // Each piece goes back as it arrives, so a stream stays a stream.
+                                while let Ok(Some(piece)) = resp.chunk().await {
+                                    answer.extend_from_slice(&piece);
+                                    if socket.write_all(&piece).await.is_err() {
+                                        break;
+                                    }
+                                    let _ = socket.flush().await;
+                                }
+                                (status, kind, retry, answer)
+                            }
+                            Err(e) => {
+                                let said = format!("the recorder could not reach {upstream}: {e}");
+                                let _ = socket
+                                    .write_all(format!("HTTP/1.1 502 Bad Gateway\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{said}", said.len()).as_bytes())
+                                    .await;
+                                (502, String::new(), None, said.into_bytes())
+                            }
+                        };
+                        let _ = socket.shutdown().await;
+                        let _ = (kind, retry);
+                        let record = serde_json::json!({
+                            "path": path,
+                            "request": serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null),
+                            "status": status,
+                            "response": String::from_utf8_lossy(&answer),
+                        });
+                        let _ = std::fs::write(kept.join(format!("{number:04}.json")), record.to_string());
+                    });
+                }
+            });
+        });
+        Wire { port, dir }
+    }
+
+    /// Where narsil is pointed, for a backend whose address ends in `path` (`/v1`, or nothing).
+    pub fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// Everything that has gone through, in the order it was asked.
+    pub fn exchanges(&self) -> Vec<Exchange> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&self.dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        files.sort();
+        files
+            .iter()
+            .filter_map(|file| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(file).ok()?).ok())
+            .map(|v| Exchange {
+                path: v["path"].as_str().unwrap_or("").to_string(),
+                request: v["request"].clone(),
+                status: v["status"].as_u64().unwrap_or(0) as u16,
+                response: v["response"].as_str().unwrap_or("").to_string(),
+            })
+            .collect()
+    }
 }

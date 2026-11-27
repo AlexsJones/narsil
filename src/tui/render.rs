@@ -62,6 +62,8 @@ pub enum Item {
         agents: Vec<AgentInfo>,
     },
     Note { text: String },
+    /// What a request used, once it is done: `request` is the message that asked.
+    Receipt { request: i64, text: String },
     Error { text: String },
     Divider { text: String },
 }
@@ -354,6 +356,7 @@ fn render(item: &Item, width: usize, expanded: bool, spin: usize, cwd: &str) -> 
         // What narsil found in the vault for a request is shown as the vault's.
         Item::Note { text } if text.starts_with("Obsidian:") => prefixed(text, width, "◈ ", "  ", Style::new().fg(VAULT)),
         Item::Note { text } => prefixed(text, width, "· ", "  ", dim()),
+        Item::Receipt { text, .. } => prefixed(text, width, "∑ ", "  ", dim()),
         Item::Error { text } => prefixed(text, width, "✗ ", "  ", Style::new().fg(Color::Red)),
         Item::Divider { text } => {
             let pad = width.saturating_sub(text.chars().count() + 2) / 2;

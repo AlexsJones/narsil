@@ -142,10 +142,13 @@ impl StoredMessage {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Usage {
+    /// Input tokens that were neither read from a cache nor written to one.
     pub input: i64,
     pub output: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    /// The backend reported no counts: these are narsil's own estimate.
+    pub estimated: bool,
 }
 
 impl Usage {

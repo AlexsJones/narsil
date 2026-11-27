@@ -45,6 +45,22 @@ Source layout: `engine.rs` (the loop), `store.rs` (the database), `memory.rs` (t
 `tools/` (what the model can call), `tui/` (the interface), `setup.rs`, `service.rs`, `voice.rs`.
 `tests/` holds the scenarios and the live tests.
 
+`tests/usage.rs` checks the account of tokens: that a request's receipt is the sum of its calls,
+subagents and compaction included, and that each backend's way of reporting usage (served by a
+stand-in) arrives as the same numbers. `tests/accuracy.rs` holds it to real backends and runs only
+when asked for: a recorder between narsil and the backend keeps every answer, and narsil's record
+must match it call for call.
+
+```sh
+NARSIL_LIVE_PROVIDER=deepseek NARSIL_LIVE_MODEL=deepseek-v4-pro NARSIL_LIVE_KEY_ENV=DEEPSEEK_API_KEY \
+  cargo test --test accuracy -- --ignored --nocapture
+NARSIL_LIVE_PROVIDER=local NARSIL_LIVE_MODEL=<model> NARSIL_LIVE_BASE_URL=http://127.0.0.1:8080/v1 \
+  cargo test --test accuracy -- --ignored --nocapture
+```
+
+Run it after changing how a provider's usage is read, and for a backend narsil has not been checked
+against.
+
 `tests/local.rs` checks what narsil asks of llmfit, with a script standing in for it. A test instance
 has no llmfit unless the test gives it one, so the suite is the same on a machine with llmfit
 installed and on one without.

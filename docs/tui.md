@@ -100,6 +100,14 @@ Enter on a file opens a window on **what narsil has done to that file**: each re
 latest first, with what an edit took out and put in, and below that what stands changed in the file
 against git. From there enter goes to that step in the conversation, and esc closes the window.
 
+## Tokens
+
+When a request is done, a line under it says what it used: the calls to the model, the tokens in
+(and how much of that was read from cache), the tokens out, and how long it took. The status bar
+keeps the running total for the session and its subagents, as `↑in ↓out`. `/usage` opens the whole
+account: by request, by model, and what a call carries now. A `~` marks a figure that is partly
+narsil's estimate. [Observability](observability.md#tokens) says how the figures are arrived at.
+
 ## Themes
 
 `/theme` opens the list of colour themes. Moving over one puts it in force, so the whole screen shows
@@ -129,7 +137,7 @@ takes it, and more tabs walk through the others. After `/cd`, tab completes fold
 
 `/new` `/clear` `/sessions` `/resume <id>` `/continue` `/compact` `/goal <objective>` `/goals`
 `/pause` `/cleargoal` `/agents` `/back` `/cd <dir>` `/files` `/panel` `/model [text]`
-`/provider [name]` `/memory [query]` `/remember <text>` `/forget <id>` `/trace` `/stats`
+`/provider [name]` `/memory [query]` `/remember <text>` `/forget <id>` `/trace` `/stats` `/usage`
 `/logs [errors]` `/theme [name]` `/keys` `/auto` `/ask` `/reload` `/daemonrestart` `/title <text>`
 `/help`.
 

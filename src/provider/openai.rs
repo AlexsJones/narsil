@@ -235,7 +235,34 @@ struct StreamState {
     finish: Option<String>,
     usage: Usage,
     saw_usage: bool,
+    /// What an llama.cpp server (and Ollama, which runs one) says of its own work:
+    /// tokens taken from its cache, newly evaluated, and generated.
+    timings: Option<(i64, i64, i64)>,
     done: bool,
+}
+
+/// What a `usage` object says was used. Backends agree on the outline, and
+/// differ in where they put what was cached and whether reasoning is counted
+/// with the output:
+///
+/// - `prompt_tokens` is the whole prompt everywhere, cached part included.
+/// - Read from a cache: `prompt_tokens_details.cached_tokens` (OpenAI, and
+///   most others), or `prompt_cache_hit_tokens` (DeepSeek's first name for it).
+/// - Written to a cache, where that is charged apart:
+///   `prompt_tokens_details.cache_write_tokens` (OpenRouter) or
+///   `.created_cache_tokens` (vLLM).
+/// - Output: `completion_tokens`. xAI, and Gemini's OpenAI endpoint, leave
+///   reasoning out of it and put it in `total_tokens` only, so where the total
+///   says more was produced than `completion_tokens` does, the total is right.
+fn read_usage(u: &Value) -> Usage {
+    let n = |path: &str| u.pointer(path).and_then(Value::as_i64);
+    let prompt = n("/prompt_tokens").unwrap_or(0).max(0);
+    let cache_read = n("/prompt_tokens_details/cached_tokens").or(n("/prompt_cache_hit_tokens")).unwrap_or(0).clamp(0, prompt);
+    let cache_write =
+        n("/prompt_tokens_details/cache_write_tokens").or(n("/prompt_tokens_details/created_cache_tokens")).unwrap_or(0).clamp(0, prompt - cache_read);
+    let completion = n("/completion_tokens").unwrap_or(0).max(0);
+    let output = n("/total_tokens").map(|total| total - prompt).filter(|produced| *produced > completion).unwrap_or(completion);
+    Usage { input: prompt - cache_read - cache_write, output, cache_read, cache_write, estimated: false }
 }
 
 impl StreamState {
@@ -251,13 +278,15 @@ impl StreamState {
                 ProviderError::Retryable { message: format!("stream error: {msg}"), retry_after: None }
             });
         }
-        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-            let cached = u.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_i64).unwrap_or(0);
-            let prompt = u["prompt_tokens"].as_i64().unwrap_or(0);
-            self.usage.cache_read = cached.min(prompt);
-            self.usage.input = prompt - self.usage.cache_read;
-            self.usage.output = u["completion_tokens"].as_i64().unwrap_or(0);
+        // Usage comes on a chunk of its own, on the last chunk with content, or on every
+        // chunk as a running count: the last one seen stands. Groq also sends it under `x_groq`.
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()).or_else(|| v.pointer("/x_groq/usage").filter(|u| u.is_object())) {
+            self.usage = read_usage(u);
             self.saw_usage = true;
+        }
+        if let Some(t) = v.get("timings").filter(|t| t.is_object()) {
+            let n = |key: &str| t[key].as_i64().unwrap_or(0).max(0);
+            self.timings = Some((n("cache_n"), n("prompt_n"), n("predicted_n")));
         }
         let Some(choice) = v["choices"].get(0) else {
             return Ok(());
@@ -324,13 +353,48 @@ impl StreamState {
             let id = if c.id.is_empty() { format!("call_{}", new_id()) } else { c.id };
             blocks.push(Block::ToolUse { id, name: c.name, input: parse_tool_input(&c.args), extra: c.extra });
         }
+        if let Some((cached, evaluated, generated)) = self.timings {
+            if !self.saw_usage {
+                // No usage asked for or given, but the server's own count is as good.
+                self.usage = Usage { input: evaluated, output: generated, cache_read: cached, cache_write: 0, estimated: false };
+                self.saw_usage = true;
+            } else {
+                // The server evaluated `evaluated` tokens and took `cached` from its cache: together, the
+                // prompt. Builds that report only the evaluated part as `prompt_tokens` (Ollama 0.30.0),
+                // or that do not say what was cached (llama.cpp before 2026), are put right from this.
+                let prompt = (self.usage.input + self.usage.cache_read + self.usage.cache_write).max(cached + evaluated);
+                if self.usage.cache_read == 0 {
+                    self.usage.cache_read = cached.min(prompt);
+                }
+                self.usage.input = (prompt - self.usage.cache_read - self.usage.cache_write).max(0);
+            }
+        }
+        // How large the request was, near enough, by its length.
+        let chars: usize = req.system.len()
+            + req.messages.iter().map(|m| serde_json::to_string(&m.blocks).map(|s| s.len()).unwrap_or(0)).sum::<usize>()
+            + req.tools.iter().map(|t| t.name.len() + t.schema.to_string().len() + t.description.len()).sum::<usize>();
+        let expected = crate::util::estimate_tokens(chars);
+        let stated = self.usage.input + self.usage.cache_read + self.usage.cache_write;
+        if self.saw_usage && stated * 5 < expected * 2 {
+            // The server says the prompt was under two fifths of any size it could have been. That
+            // is a server counting only what it newly evaluated and leaving out what it had cached
+            // (Ollama has done so in several versions). What it left out is put back, as read from
+            // its cache, and the count is marked as partly narsil's own: without this the context
+            // would look smaller than it is, and would be compacted too late.
+            self.usage.cache_read += expected - stated;
+            self.usage.estimated = true;
+        }
         if !self.saw_usage {
-            // No usage from the server: estimate, so compaction still triggers.
-            let chars: usize = req.system.len()
-                + req.messages.iter().map(|m| serde_json::to_string(&m.blocks).map(|s| s.len()).unwrap_or(0)).sum::<usize>()
-                + req.tools.iter().map(|t| t.schema.to_string().len() + t.description.len()).sum::<usize>();
-            self.usage.input = crate::util::estimate_tokens(chars);
-            self.usage.output = crate::util::estimate_tokens(self.text.len());
+            // No usage from the server: estimate, so compaction still triggers, and say that it is one.
+            let said: usize = blocks
+                .iter()
+                .map(|b| match b {
+                    Block::Text { text } | Block::Thinking { text, .. } => text.len(),
+                    Block::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
+                    _ => 0,
+                })
+                .sum();
+            self.usage = Usage { input: crate::util::estimate_tokens(chars), output: crate::util::estimate_tokens(said), estimated: true, ..Default::default() };
         }
         let stop = match self.finish.as_deref() {
             Some("length") => StopReason::MaxTokens,
@@ -428,6 +492,117 @@ mod tests {
         assert_eq!(render_messages(&msgs, true)[1]["reasoning_content"], "plan");
     }
 
+    /// What narsil takes a stream's usage to be: (input that was neither read from a cache
+    /// nor written to one, read from cache, written to cache, output, estimated).
+    fn used(chunks: &[&str]) -> (i64, i64, i64, i64, bool) {
+        let sink = |_e: StreamEvent| {};
+        let mut st = StreamState::default();
+        for c in chunks {
+            st.handle(c, &sink).unwrap();
+        }
+        let msgs = [];
+        let u = st.finish(&req(&msgs)).unwrap().usage;
+        (u.input, u.cache_read, u.cache_write, u.output, u.estimated)
+    }
+
+    const SAID: &str = r#"{"choices":[{"index":0,"delta":{"content":"ok"}}]}"#;
+    const DONE: &str = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+
+    // Each backend's usage as its documentation (or, for the open servers, its source) gives it.
+    // The whole prompt is always input + read + written; what differs is where the parts are found.
+    #[test]
+    fn usage_is_read_as_each_backend_reports_it() {
+        // OpenAI: a last chunk with no choices; cached tokens inside prompt_tokens, reasoning inside completion_tokens.
+        let openai = r#"{"choices":[],"usage":{"prompt_tokens":2006,"completion_tokens":300,"total_tokens":2306,"prompt_tokens_details":{"cached_tokens":1920,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":128}}}"#;
+        assert_eq!(used(&[SAID, DONE, openai]), (86, 1920, 0, 300, false));
+
+        // DeepSeek: on the last chunk, which has a choice; cache hits under its own name and under OpenAI's.
+        let deepseek = r#"{"choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":4100,"completion_tokens":11,"total_tokens":4111,"prompt_tokens_details":{"cached_tokens":3968},"prompt_cache_hit_tokens":3968,"prompt_cache_miss_tokens":132}}"#;
+        assert_eq!(used(&[SAID, deepseek]), (132, 3968, 0, 11, false));
+        // And as it was before it took up OpenAI's name.
+        let deepseek_then = r#"{"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":5,"total_tokens":1005,"prompt_cache_hit_tokens":896,"prompt_cache_miss_tokens":104}}"#;
+        assert_eq!(used(&[SAID, deepseek_then]), (104, 896, 0, 5, false));
+
+        // xAI: reasoning is not in completion_tokens; the total has it (32 + 9 + 94 = 135).
+        let xai = r#"{"choices":[],"usage":{"prompt_tokens":32,"completion_tokens":9,"total_tokens":135,"prompt_tokens_details":{"text_tokens":32,"cached_tokens":6},"completion_tokens_details":{"reasoning_tokens":94}}}"#;
+        assert_eq!(used(&[SAID, DONE, xai]), (26, 6, 0, 103, false));
+        // Gemini through its OpenAI endpoint: thinking is in the total only.
+        let gemini = r#"{"choices":[],"usage":{"completion_tokens":102,"prompt_tokens":758,"total_tokens":1725}}"#;
+        assert_eq!(used(&[SAID, DONE, gemini]), (758, 0, 0, 967, false));
+
+        // OpenRouter: a usage chunk with a choice that repeats the finish reason; cache writes named apart.
+        let openrouter = r#"{"id":"gen-1","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop","native_finish_reason":"stop"}],"usage":{"prompt_tokens":194,"completion_tokens":2,"total_tokens":196,"cost":0.00095,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":100},"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+        assert_eq!(used(&[SAID, DONE, openrouter]), (94, 0, 100, 2, false));
+
+        // Mistral: null on every chunk but the last, which carries content, the finish reason and the usage.
+        let mistral_first = r#"{"choices":[{"index":0,"delta":{"content":"1"},"finish_reason":null}],"usage":null}"#;
+        let mistral_last = r#"{"choices":[{"index":0,"delta":{"content":"00"},"finish_reason":"stop"}],"usage":{"prompt_tokens":19,"completion_tokens":7,"total_tokens":26}}"#;
+        assert_eq!(used(&[mistral_first, mistral_last]), (19, 0, 0, 7, false));
+
+        // Groq: timings beside the counts, and the same object under `x_groq` on the last chunk.
+        let groq = r#"{"choices":[],"usage":{"queue_time":0.037,"prompt_tokens":4641,"prompt_time":0.0006,"completion_tokens":556,"completion_time":0.46,"total_tokens":5197,"total_time":0.46,"prompt_tokens_details":{"cached_tokens":4608}}}"#;
+        assert_eq!(used(&[SAID, DONE, groq]), (33, 4608, 0, 556, false));
+        let groq_x = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"x_groq":{"id":"req_1","usage":{"prompt_tokens":18,"completion_tokens":556,"total_tokens":574}}}"#;
+        assert_eq!(used(&[SAID, groq_x]), (18, 0, 0, 556, false));
+
+        // vLLM: what its prefix cache took in is named too; a running count on every chunk ends on the true one.
+        let vllm_running = r#"{"choices":[{"index":0,"delta":{"content":"o"}}],"usage":{"prompt_tokens":900,"completion_tokens":1,"total_tokens":901}}"#;
+        let vllm = r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":40,"total_tokens":940,"prompt_tokens_details":{"cached_tokens":512,"created_cache_tokens":300},"completion_tokens_details":{"reasoning_tokens":12}}}"#;
+        assert_eq!(used(&[vllm_running, DONE, vllm]), (88, 512, 300, 40, false));
+
+        // LM Studio: the three counts and no more.
+        let lmstudio = r#"{"choices":[],"usage":{"prompt_tokens":1203,"completion_tokens":57,"total_tokens":1260}}"#;
+        assert_eq!(used(&[SAID, DONE, lmstudio]), (1203, 0, 0, 57, false));
+    }
+
+    #[test]
+    fn a_llama_cpp_servers_own_count_fills_in_what_its_usage_leaves_out() {
+        // A current llama-server: the whole prompt, what was cached, and its timings on the last chunk. They agree.
+        let now = r#"{"choices":[],"usage":{"completion_tokens":24,"prompt_tokens":5120,"total_tokens":5144,"prompt_tokens_details":{"cached_tokens":5000}},"timings":{"cache_n":5000,"prompt_n":120,"predicted_n":24}}"#;
+        assert_eq!(used(&[SAID, DONE, now]), (120, 5000, 0, 24, false));
+
+        // A build from before it said what was cached: the timings say.
+        let before = r#"{"choices":[],"usage":{"completion_tokens":24,"prompt_tokens":5120,"total_tokens":5144},"timings":{"cache_n":5000,"prompt_n":120,"predicted_n":24}}"#;
+        assert_eq!(used(&[SAID, DONE, before]), (120, 5000, 0, 24, false));
+
+        // Ollama 0.30.0 gave only the newly evaluated part as prompt_tokens. The prompt was 5120 all the same.
+        let ollama_030 = r#"{"choices":[],"usage":{"completion_tokens":24,"prompt_tokens":120,"total_tokens":144},"timings":{"cache_n":5000,"prompt_n":120,"predicted_n":24}}"#;
+        assert_eq!(used(&[SAID, DONE, ollama_030]), (120, 5000, 0, 24, false));
+
+        // The timings on the finish chunk and the usage after it, as a stream has them.
+        let timed = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"timings":{"cache_n":0,"prompt_n":812,"predicted_n":9}}"#;
+        let counted = r#"{"choices":[],"usage":{"completion_tokens":9,"prompt_tokens":812,"total_tokens":821}}"#;
+        assert_eq!(used(&[SAID, timed, counted]), (812, 0, 0, 9, false));
+
+        // No usage at all (a server that would not take `stream_options`), but timings: a count, not an estimate.
+        assert_eq!(used(&[SAID, timed]), (812, 0, 0, 9, false));
+        // Neither: narsil's own estimate, and marked as one.
+        assert!(used(&[SAID, DONE]).4);
+    }
+
+    #[test]
+    fn a_prompt_reported_far_smaller_than_it_was_is_put_right_and_marked() {
+        // A request of about 5,000 tokens by its length.
+        let msgs = [Message::user_text("word ".repeat(4000))];
+        let finish = |usage: &str| {
+            let sink = |_e: StreamEvent| {};
+            let mut st = StreamState::default();
+            for chunk in [SAID, DONE, usage] {
+                st.handle(chunk, &sink).unwrap();
+            }
+            let u = st.finish(&req(&msgs)).unwrap().usage;
+            (u.input, u.cache_read, u.output, u.estimated)
+        };
+        // A server that counted only the 150 tokens it newly evaluated: the rest was in its cache.
+        let (new, cached, output, estimated) = finish(r#"{"choices":[],"usage":{"prompt_tokens":150,"completion_tokens":21,"total_tokens":171}}"#);
+        assert_eq!((new, output, estimated), (150, 21, true));
+        assert!((4800..=5200).contains(&(new + cached)), "{new} + {cached}");
+        // A count that is merely on the low side of narsil's guess is the server's to make: tokenizers differ.
+        assert_eq!(finish(r#"{"choices":[],"usage":{"prompt_tokens":3100,"completion_tokens":21,"total_tokens":3121}}"#), (3100, 0, 21, false));
+        // As is one on the high side.
+        assert_eq!(finish(r#"{"choices":[],"usage":{"prompt_tokens":9000,"completion_tokens":21,"total_tokens":9021}}"#), (9000, 0, 21, false));
+    }
+
     #[test]
     fn missing_usage_is_estimated_and_truncation_is_reported() {
         let sink = |_e: StreamEvent| {};
@@ -438,5 +613,6 @@ mod tests {
         assert_eq!(res.stop, StopReason::MaxTokens);
         assert!(res.usage.input >= 100);
         assert_eq!(res.usage.output, 2);
+        assert!(res.usage.estimated);
     }
 }

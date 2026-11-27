@@ -47,6 +47,8 @@ You can see what it did, what it is doing, and whose work each line is.
   the tokens. `/trace` shows it live.
 - Every log line, status line and total names its session, subagent and goal the same way, so one
   id finds everything about a run: `narsil logs --session <id>`.
+- Every request ends with what it used: calls, tokens in and out, how much was cached. `/usage`
+  breaks it down, including what narsil itself adds to each call.
 - The plan, who holds which item, and what each subagent is doing now are in the side panel. What
   the agent knows and what there is to do are files, not rows in a database you cannot read.
 

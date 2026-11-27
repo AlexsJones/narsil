@@ -103,10 +103,25 @@ impl Client {
             }
             blocks.insert(0, Block::Text { text: say.clone() });
         }
+        // Counted as a backend with a prompt cache would: the first request writes the
+        // instructions to the cache, and each later one reads everything up to its last message.
+        let whole = estimate_tokens(prompt_chars);
+        let before_last: usize = req.system.len()
+            + req.messages.iter().rev().skip(1).map(|m| serde_json::to_string(&m.blocks).map(|s| s.len()).unwrap_or(0)).sum::<usize>();
+        let (cache_read, cache_write) = match req.messages.len() {
+            0 | 1 => (0, estimate_tokens(req.system.len()).min(whole)),
+            _ => (estimate_tokens(before_last).min(whole), 0),
+        };
         Ok(ChatResponse {
             blocks,
             stop,
-            usage: Usage { input: estimate_tokens(prompt_chars), output: estimate_tokens(say.len()) + 1, ..Default::default() },
+            usage: Usage {
+                input: whole - cache_read - cache_write,
+                output: estimate_tokens(say.len()) + 1,
+                cache_read,
+                cache_write,
+                estimated: false,
+            },
         })
     }
 }

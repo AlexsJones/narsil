@@ -60,6 +60,7 @@ narsil config path | show | edit [config|soul|agents]
 narsil doctor                              # config, backend reachability, daemon, sudo
 narsil trace [id]                          # the tree of what a session or goal did, with timings
 narsil stats --since 24h                   # time and tokens per model, time and failures per tool
+narsil usage [id]                          # tokens a session used: in, cached, out, by request
 narsil service install                     # systemd user unit: restart on crash, start at login
 ```
 

@@ -32,6 +32,28 @@ use serde_json::Value;
 use crate::types::{Block, MsgKind, Role, StoredMessage};
 use crate::util::{new_id, now};
 
+/// One answered request to a model, as the usage record has it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelCall {
+    pub session: String,
+    pub root: String,
+    /// The message in the root session that asked for the work this was part of.
+    pub request: i64,
+    /// `turn` or `compaction`.
+    pub purpose: String,
+    pub provider: String,
+    pub model: String,
+    /// Input tokens neither read from a cache nor written to one.
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub output: i64,
+    /// The backend reported nothing, and these are narsil's own estimate.
+    pub estimated: bool,
+    pub started_ms: i64,
+    pub dur_ms: i64,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id            TEXT PRIMARY KEY,
@@ -209,6 +231,26 @@ CREATE INDEX IF NOT EXISTS work_events_item ON work_events(item, id);
 -- What narsil did and how long it took: one row per recorded span (a session
 -- run, a model call, a tool call...). Written by the telemetry recorder as
 -- spans open and close, so a span still open when the daemon died is visible.
+-- Every request to a model that was answered, with the tokens the backend
+-- says it used. What narsil reports of token use is added up from here.
+CREATE TABLE IF NOT EXISTS model_usage (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    root_id     TEXT NOT NULL,
+    request_id  INTEGER NOT NULL DEFAULT 0,   -- the message in the root session that asked for the work
+    purpose     TEXT NOT NULL DEFAULT 'turn', -- turn | compaction
+    provider    TEXT NOT NULL DEFAULT '',
+    model       TEXT NOT NULL DEFAULT '',
+    input       INTEGER NOT NULL DEFAULT 0,   -- input neither read from a cache nor written to one
+    cache_read  INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0,
+    output      INTEGER NOT NULL DEFAULT 0,
+    estimated   INTEGER NOT NULL DEFAULT 0,   -- the backend reported nothing: narsil's own count
+    started_ms  INTEGER NOT NULL,             -- unix time
+    dur_ms      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS model_usage_root ON model_usage(root_id, id);
+
 CREATE TABLE IF NOT EXISTS spans (
     id       INTEGER PRIMARY KEY,
     parent   INTEGER,                    -- the recorded span this one ran inside
@@ -739,6 +781,82 @@ impl Store {
             params![id, message_id],
         )?;
         Ok(())
+    }
+
+    /// Write down a request to a model that was answered.
+    pub fn usage_add(&self, call: &ModelCall) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO model_usage (session_id, root_id, request_id, purpose, provider, model, input, cache_read, cache_write, \
+             output, estimated, started_ms, dur_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                call.session,
+                call.root,
+                call.request,
+                call.purpose,
+                call.provider,
+                call.model,
+                call.input,
+                call.cache_read,
+                call.cache_write,
+                call.output,
+                call.estimated,
+                call.started_ms,
+                call.dur_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every answered request to a model in a session tree, in the order they were made.
+    pub fn usage_for_root(&self, root: &str) -> Result<Vec<ModelCall>> {
+        let db = self.db();
+        let mut q = db.prepare(
+            "SELECT session_id, root_id, request_id, purpose, provider, model, input, cache_read, cache_write, output, estimated, \
+             started_ms, dur_ms FROM model_usage WHERE root_id = ?1 ORDER BY id",
+        )?;
+        let rows = q.query_map(params![root], |r| {
+            Ok(ModelCall {
+                session: r.get(0)?,
+                root: r.get(1)?,
+                request: r.get(2)?,
+                purpose: r.get(3)?,
+                provider: r.get(4)?,
+                model: r.get(5)?,
+                input: r.get(6)?,
+                cache_read: r.get(7)?,
+                cache_write: r.get(8)?,
+                output: r.get(9)?,
+                estimated: r.get(10)?,
+                started_ms: r.get(11)?,
+                dur_ms: r.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The message that asked for the work a session is doing now: the last
+    /// thing said to it that is not a tool's result or a note of narsil's own.
+    /// 0 when nothing has been asked (a goal's session, which is given notes).
+    pub fn current_request(&self, session: &str) -> Result<i64> {
+        Ok(self.db().query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1 AND role = 'user' AND kind = 'message' \
+             AND blocks NOT LIKE '%\"type\":\"tool_result\"%'",
+            params![session],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The messages with these ids, as their stored blocks.
+    pub fn message_blocks(&self, ids: &[i64]) -> Result<Vec<(i64, String)>> {
+        let db = self.db();
+        let mut q = db.prepare("SELECT blocks FROM messages WHERE id = ?1")?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(blocks) = q.query_row(params![id], |r| r.get::<_, String>(0)).optional()? {
+                out.push((*id, blocks));
+            }
+        }
+        Ok(out)
     }
 
     pub fn add_usage(&self, id: &str, input: i64, output: i64, context: i64) -> Result<()> {
@@ -1485,6 +1603,11 @@ impl Store {
     }
 
     /// The session tree that most recently did anything.
+    /// The session tree that used a model most recently.
+    pub fn latest_usage_root(&self) -> Result<Option<String>> {
+        Ok(self.db().query_row("SELECT root_id FROM model_usage ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).optional()?)
+    }
+
     pub fn latest_span_root(&self) -> Result<Option<String>> {
         let db = self.db();
         Ok(db

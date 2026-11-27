@@ -28,7 +28,7 @@ use crate::proto::{ApprovalInfo, Envelope, Event, ProviderModels};
 use crate::provider::{self, ChatRequest, ChatResponse, Provider, ProviderError, StopReason, StreamEvent};
 use crate::store::{AgentInfo, NewSession, Session, Store, ToolCall};
 use crate::tools::{self, ToolCtx};
-use crate::types::{Block, Message, MsgKind, Role, StoredMessage, blocks_text};
+use crate::types::{Block, Message, MsgKind, Role, StoredMessage, Usage, blocks_text};
 use crate::util::{estimate_tokens, first_line, new_id, shell_quote, truncate_middle};
 
 pub type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -114,6 +114,32 @@ pub struct Engine {
     /// The kinds of credential, and the credential stores, a session has already been told how to handle.
     handled: Mutex<HashMap<String, HashSet<String>>>,
     shutting_down: AtomicBool,
+}
+
+impl Engine {
+    /// Write down what an answered request to a model used: the record that
+    /// every report of token use is added up from. `timed` is when the request
+    /// was made (unix ms) and how long it took.
+    fn count(&self, session: &Session, purpose: &str, provider: &str, model: &str, usage: &Usage, timed: (i64, Duration)) {
+        let call = crate::store::ModelCall {
+            session: session.id.clone(),
+            root: session.root_id.clone(),
+            request: self.store.current_request(&session.root_id).unwrap_or(0),
+            purpose: purpose.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            input: usage.input,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            output: usage.output,
+            estimated: usage.estimated,
+            started_ms: timed.0,
+            dur_ms: timed.1.as_millis() as i64,
+        };
+        if let Err(e) = self.store.usage_add(&call) {
+            logln!("session {}: could not record token use: {e}", session.id);
+        }
+    }
 }
 
 /// The span for one request to a model. One per attempt, so retries show.
@@ -1312,6 +1338,8 @@ impl Engine {
         let mut stripped = false;
         // The span of the latest request, kept so the reply's message id can be put on it.
         let mut call: Option<Span>;
+        // When the latest request was made, and how long it took.
+        let mut timed: (i64, Duration);
 
         let response = loop {
             let result = {
@@ -1338,6 +1366,7 @@ impl Engine {
                 };
                 let span = call_span(&model_id, &pname, attempt + 1, "turn", messages.len());
                 let started = std::time::Instant::now();
+                let began = crate::telemetry::now_ms();
                 let first_token: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
                 let sink = |ev: StreamEvent| {
                     first_token.get_or_init(|| started.elapsed());
@@ -1352,6 +1381,7 @@ impl Engine {
                 };
                 record_call(&span, result.as_ref(), first_token.get().copied());
                 call = Some(span);
+                timed = (began, started.elapsed());
                 result
             };
             match result {
@@ -1417,6 +1447,7 @@ impl Engine {
         };
 
         let usage = response.usage.clone();
+        self.count(&session, "turn", &pname, &model_id, &usage, timed);
         logln!(
             "model call used {} input tokens ({} read from cache, {} written to it), {} output",
             usage.input + usage.cache_read + usage.cache_write,
@@ -1554,8 +1585,10 @@ impl Engine {
         let sink = |_ev: StreamEvent| {};
         let mut attempt = 0u32;
         let (pname, _) = split_model_ref(&session.model);
+        let mut timed: (i64, Duration);
         let response = loop {
             let span = call_span(model_id, pname, attempt + 1, "compaction", messages.len());
+            let (began, started) = (crate::telemetry::now_ms(), std::time::Instant::now());
             let result = tokio::select! {
                 r = provider.chat(&req, &sink).instrument(span.clone()) => r,
                 _ = cancel.cancelled() => {
@@ -1565,6 +1598,7 @@ impl Engine {
             };
             record_call(&span, Some(&result), None);
             drop(span);
+            timed = (began, started.elapsed());
             match result {
                 Ok(r) => break Some(r),
                 Err(ProviderError::Retryable { message, retry_after }) if attempt < 6 => {
@@ -1580,6 +1614,9 @@ impl Engine {
                 Err(e) => bail!("compaction failed: {e}"),
             }
         };
+        if let Some(r) = &response {
+            self.count(session, "compaction", pname, model_id, &r.usage, timed);
+        }
         let summary = response.as_ref().map(|r| blocks_text(&r.blocks)).unwrap_or_default();
         if summary.trim().is_empty() {
             if overflowed {

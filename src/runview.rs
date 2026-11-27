@@ -68,6 +68,11 @@ pub fn approval(who: &str, tool: &str, summary: &str, width: usize, color: bool)
     out
 }
 
+/// What the run used, above the line that closes it.
+pub fn receipt(line: &str, color: bool) -> String {
+    if color { format!("{DIM}∑ {line}{RESET}") } else { format!("∑ {line}") }
+}
+
 /// The line that closes a run: which session it was, and how to go back to it.
 pub fn footer(session: &str, color: bool) -> String {
     if color { format!("{DIM}session {session}  ·  narsil resume {session}{RESET}") } else { format!("session {session}  ·  narsil resume {session}") }

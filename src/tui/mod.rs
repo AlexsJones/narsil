@@ -311,6 +311,12 @@ struct App {
     completing: Option<(String, usize)>,
     /// An open /trace or /stats: which, when it was last read, and whether it follows the latest steps.
     live_view: Option<(&'static str, Instant, bool)>,
+    /// What this session and its subagents have used so far, for the status bar.
+    meter: crate::usage::Tokens,
+    /// The request in hand: the message that asked for it (0: none).
+    open_request: i64,
+    /// While a session's history is being put on screen: what each of its requests used.
+    past_receipts: Option<std::collections::HashMap<i64, crate::usage::Tokens>>,
     /// The file explorer on the left: shown, and whether the keyboard is in it.
     files_visible: bool,
     files_focus: bool,
@@ -870,6 +876,9 @@ impl App {
             pending_model: None,
             completing: None,
             live_view: None,
+            meter: crate::usage::Tokens::default(),
+            open_request: 0,
+            past_receipts: None,
             files_visible: false,
             files_focus: false,
             files_sel: 0,
@@ -961,7 +970,39 @@ impl App {
         self.entries.iter_mut().rev().find(|e| matches!(&e.item, Item::Tool { id: i, .. } if i == id))
     }
 
+    /// Whether the session on screen is one a person talks to, not a subagent of one.
+    fn at_root(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.id == s.root_id)
+    }
+
+    /// Put what a request used under it, in place of any earlier count for the same request
+    /// (one that was interrupted and taken up again is still one request).
+    fn receipt(&mut self, request: i64) {
+        if request == 0 || !self.at_root() {
+            return;
+        }
+        let used = match &self.past_receipts {
+            Some(known) => known.get(&request).cloned(),
+            None => {
+                let root = self.session.as_ref().map(|s| s.root_id.clone()).unwrap_or_default();
+                crate::usage::receipts(&self.store, &root).into_iter().find(|(id, _)| *id == request).map(|(_, t)| t)
+            }
+        };
+        let Some(used) = used.filter(|t| t.calls > 0) else { return };
+        self.entries.retain(|e| !matches!(&e.item, Item::Receipt { request: r, .. } if *r == request));
+        self.push(Item::Receipt { request, text: crate::usage::receipt_line(&used) });
+    }
+
     fn push_message(&mut self, m: &StoredMessage) {
+        // Something new asked of the session: the request before it is done, and this is the one in hand.
+        let asks = m.role == Role::User
+            && m.kind == MsgKind::Message
+            && m.blocks.iter().any(|b| matches!(b, Block::Text { .. }))
+            && !m.blocks.iter().any(|b| matches!(b, Block::ToolResult { .. }));
+        if asks && self.at_root() {
+            self.receipt(self.open_request);
+            self.open_request = m.id;
+        }
         self.last_msg_id = self.last_msg_id.max(m.id);
         self.cur_msg = m.id;
         self.push_message_items(m);
@@ -1053,9 +1094,16 @@ impl App {
         self.panel_sel = 0;
         let work: Vec<WorkItem> = serde_json::from_value(v["work"].clone()).unwrap_or_default();
         self.agents = serde_json::from_value(v["agents"].clone()).unwrap_or_default();
+        self.open_request = 0;
+        self.past_receipts = Some(crate::usage::receipts(&self.store, &session.root_id).into_iter().collect());
         for m in &messages {
             self.push_message(m);
         }
+        if v["running"] != true {
+            self.receipt(self.open_request);
+        }
+        self.past_receipts = None;
+        self.meter = crate::usage::totals(&self.store, &session.root_id);
         self.sync_all_spawns();
         self.approvals = serde_json::from_value::<Vec<ApprovalInfo>>(v["approvals"].clone()).unwrap_or_default().into();
         self.goal = serde_json::from_value(v["goal"].clone()).ok();
@@ -1285,7 +1333,12 @@ impl App {
                         }
                     }
                 }
+                let stopped = self.run_state == "running" && state != "running";
                 self.run_state = state;
+                if stopped {
+                    self.receipt(self.open_request);
+                    self.refresh_meter();
+                }
             }
             Event::Usage { context_tokens, input_tokens, output_tokens } => {
                 if let Some(s) = &mut self.session {
@@ -1293,6 +1346,7 @@ impl App {
                     s.input_tokens = input_tokens;
                     s.output_tokens = output_tokens;
                 }
+                self.refresh_meter();
             }
             Event::Approval { id, tool, summary } => {
                 self.approvals.push_back(ApprovalInfo { id, session: env.session, agent: env.agent, tool, summary });
@@ -1349,10 +1403,13 @@ impl App {
                 }
                 changed
             }),
-            Event::Usage { input_tokens, output_tokens, .. } => self.agent_touch(&from, |a| {
-                a.tokens = input_tokens + output_tokens;
-                false
-            }),
+            Event::Usage { input_tokens, output_tokens, .. } => {
+                self.refresh_meter();
+                self.agent_touch(&from, |a| {
+                    a.tokens = input_tokens + output_tokens;
+                    false
+                })
+            }
             Event::Approval { id, tool, summary } => {
                 let waiting = format!("waiting for your approval: {tool}");
                 self.agent_touch(&from, |a| {
@@ -1863,10 +1920,26 @@ impl App {
         true
     }
 
+    /// Add up again what this session and its subagents have used.
+    fn refresh_meter(&mut self) {
+        if let Some(root) = self.session.as_ref().map(|s| s.root_id.clone()) {
+            self.meter = crate::usage::totals(&self.store, &root);
+            self.dirty = true;
+        }
+    }
+
     /// The lines of the /trace or /stats view, read from what the daemon has recorded so far.
     fn live_lines(&self, cmd: &str) -> Option<Vec<String>> {
         if cmd == "/logs" {
             return Some(self.log_lines());
+        }
+        if cmd == "/usage" {
+            // Read again from the database: the copy here is as old as the last event.
+            let session = self.store.get_session(&self.session.as_ref()?.root_id).ok().flatten()?;
+            return Some(match crate::usage::report(&self.store, &self.cfg, &session) {
+                Ok(report) => crate::usage::lines(&report, self.overlay_text_width()),
+                Err(e) => vec![format!("could not read what was used: {e}")],
+            });
         }
         let root = self.session.as_ref().map(|s| s.root_id.clone())?;
         let spans = self.store.spans_for_root(&root).unwrap_or_default();
@@ -2441,15 +2514,23 @@ impl App {
                 self.logs = Some(LogView { min, mine: self.session.is_some(), find: String::new(), typing: false, wrap: true });
                 self.relog();
             }
-            "/trace" | "/stats" => {
+            "/trace" | "/stats" | "/usage" => {
                 self.logs = None;
                 self.file_view = None;
-                let cmd = if cmd == "/trace" { "/trace" } else { "/stats" };
+                let cmd = match cmd {
+                    "/trace" => "/trace",
+                    "/usage" => "/usage",
+                    _ => "/stats",
+                };
                 let Some(lines) = self.live_lines(cmd) else {
                     self.flash("no session open yet");
                     return;
                 };
-                let title = if cmd == "/trace" { "what this session did" } else { "time and tokens in this session" };
+                let title = match cmd {
+                    "/trace" => "what this session did",
+                    "/usage" => "tokens this session has used",
+                    _ => "time and tokens in this session",
+                };
                 // While it is working, open on the latest steps and keep up with them.
                 let working = self.run_state == "running";
                 self.live_view = Some((cmd, Instant::now(), working));
@@ -3476,6 +3557,9 @@ impl App {
             left.push_str(&format!("  ·  {text}"));
         }
         let right = match &self.session {
+            Some(s) if self.meter.calls > 0 => {
+                format!("ctx {} · {} · {} · {} ", fmt_tokens(s.context_tokens), crate::usage::meter(&self.meter), s.perm_mode, s.model)
+            }
             Some(s) => format!("ctx {} · {} · {} ", fmt_tokens(s.context_tokens), s.perm_mode, s.model),
             None => format!("{} · {} ", self.pending_mode.as_deref().unwrap_or(&self.cfg.permissions.mode), self.model_in_use()),
         };
