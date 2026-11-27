@@ -76,6 +76,10 @@ remade whenever the interface changes. No model is called: the `mock` provider f
 cargo build && docs/screenshots/make.sh        # needs tmux, git, python3 with Pillow, fontconfig
 ```
 
+`docs/screenshots/film.sh` films the same session for the animation at the top of the README
+(`assets/demo.gif`): the terminal is read five times a second and each reading drawn as a frame. It
+needs ffmpeg as well.
+
 ## Releasing
 
 The git tag is the version. Pushing one releases it:

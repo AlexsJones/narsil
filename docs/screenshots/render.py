@@ -106,9 +106,13 @@ def main():
     ap.add_argument("--size", type=int, default=30)
     ap.add_argument("--pad", type=int, default=28)
     ap.add_argument("--cols", type=int, default=0)
+    ap.add_argument("--rows", type=int, default=0, help="always this many rows: for the frames of a film")
+    ap.add_argument("--square", action="store_true", help="no rounded corners or palette: a frame, not a picture")
     args = ap.parse_args()
     fg0, bg0 = rgb(args.fg), rgb(args.bg)
     grid = cells(sys.stdin.read(), fg0, bg0)
+    if args.rows:
+        grid = (grid + [[]] * args.rows)[:args.rows]
     cols = args.cols or max(len(r) for r in grid)
     font = {style: ImageFont.truetype(font_file(style), args.size) for style in STYLES}
     ascent, descent = font["Regular"].getmetrics()
@@ -158,6 +162,9 @@ def main():
                 draw.line([x0, y0 + ascent + 3, x0 + cw - 1, y0 + ascent + 3], fill=fg, width=max(1, args.size // 16))
             if s["strike"]:
                 draw.line([x0, y0 + ch // 2 + 1, x0 + cw - 1, y0 + ch // 2 + 1], fill=fg, width=max(1, args.size // 16))
+    if args.square:
+        img.save(args.out)
+        return
     # Rounded corners, like a window's.
     r = pad
     mask = Image.new("L", img.size, 0)

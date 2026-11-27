@@ -3,6 +3,9 @@
 request typed in make.sh. See the top of src/provider/mock.rs for the format."""
 import json, pathlib, sys
 
+# How long the subagents take over their slow step: long enough to be seen at work.
+WAIT = sys.argv[2] if len(sys.argv) > 2 else "30"
+
 def tool(name, **args):
     return f"!tool {name} {json.dumps(args)}"
 
@@ -78,14 +81,14 @@ tests_agent = nested([
     tool("work_next", claim="Cover the retry with tests"),
     tool("read_file", path="tideline/backoff.py"),
     tool("write_file", path="tests/test_backoff.py", content=TESTS),
-    "!after 30 !bash python3 -m unittest -q 2>&1 | tail -3",
+    "!after " + WAIT + " !bash python3 -m unittest -q 2>&1 | tail -3",
     tool("work_done", item="Cover the retry with tests", result="tests/test_backoff.py: one call when it works, the doubling wait, giving up.", evidence="python3 -m unittest: 4 tests, OK", learned=[]),
     "!say The retry is covered by three tests, and all four in the project pass.",
 ])
 docs_agent = nested([
     tool("work_next", claim="Say how it behaves in the README"),
     tool("read_file", path="README.md"),
-    "!after 30 " + tool("edit_file", path="README.md", old_string=README_OLD, new_string=README_NEW),
+    "!after " + WAIT + " " + tool("edit_file", path="README.md", old_string=README_OLD, new_string=README_NEW),
     tool("work_done", item="Say how it behaves in the README", result="README.md says the feed is tried three times.", evidence="read back", learned=[]),
     "!say The README says how the retry behaves.",
 ])
