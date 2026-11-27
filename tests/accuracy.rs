@@ -159,6 +159,16 @@ fn the_tokens_narsil_reports_are_the_ones_the_backend_said_it_used() {
         .map(|e| if anthropic { anthropic_said(&e.response) } else { openai_said(&e.response) }.unwrap_or_else(|| panic!("no usage in an answer from the backend:\n{}", e.response)))
         .collect();
     assert!(said.len() >= 2, "the backend answered {} requests", said.len());
+    // The backend's last word on each call, as it sent it: to be read against its documentation.
+    for (i, exchange) in answered.iter().enumerate() {
+        let all = events(&exchange.response);
+        let last = all.iter().rev().find_map(|e| {
+            e.get("usage").filter(|u| u.is_object()).or_else(|| e.pointer("/x_groq/usage")).or_else(|| e.pointer("/message/usage")).map(|u| (u, e.get("choices").and_then(Value::as_array).map(Vec::len)))
+        });
+        if let Some((usage, choices)) = last {
+            println!("  call {} usage as sent{}: {usage}", i + 1, choices.map(|n| format!(" (on a chunk with {n} choices)")).unwrap_or_default());
+        }
+    }
 
     // What narsil recorded, call for call.
     let rows = narsil.column(

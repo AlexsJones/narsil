@@ -83,7 +83,7 @@ They are the backend's own, read as each backend reports them, and backends diff
 | Anthropic | reported | reported | in the output |
 | OpenAI, DeepSeek, Mistral, Groq | reported | not reported apart | in the output |
 | OpenRouter | reported | reported, for models that charge for it | in the output |
-| xAI | reported | not reported apart | left out of the output figure, so narsil takes it from the total |
+| xAI | reported | not reported apart | left out of the output figure and counted in the total, so narsil takes it from the total |
 | Gemini (OpenAI endpoint) | not documented | not documented | reported by users as left out of the output figure; taken from the total where the total says so |
 | llama.cpp | reported (from the server's timings on older builds) | none | in the output |
 | Ollama | in recent versions | none | in the output |
@@ -101,9 +101,10 @@ in several versions). In the second case narsil puts back what was left out, as 
 Not counted: a request that failed or was interrupted before the backend said what it used.
 
 Checked against the real thing with `tests/accuracy.rs` (see [Development](development.md)):
-Anthropic, DeepSeek, llama.cpp and Ollama, call for call against what each sent, with Anthropic's own
-token counter and llama.cpp's tokenizer agreeing on the size of every prompt. The others are held to
-the shapes their documentation gives.
+Anthropic, DeepSeek, xAI, llama.cpp and Ollama, call for call against what each sent, with
+Anthropic's own token counter and llama.cpp's tokenizer agreeing on the size of every prompt. On xAI
+every call's total was its prompt, its output figure and its reasoning added together, as its
+documentation's example has it. The others are held to the shapes their documentation gives.
 
 ## One id finds everything
 
