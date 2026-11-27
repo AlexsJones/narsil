@@ -24,9 +24,18 @@ select, and use tab to choose what the selection applies to: this session, new s
 and a full `/model provider/model-id` switches at once. `/provider` lists the providers and
 `/provider <name>` one provider's models. Providers are added with `narsil setup`.
 
-A session can change model between turns, including to another provider. The transcript records the
-change, the new model gets a fresh system prompt, and the previous model's reasoning blocks are no
-longer replayed. From the shell: `narsil run --session <id> --model <provider/model-id> "..."`.
+A session can change model at any time, including to another provider. The transcript records the
+change, so the new model knows the earlier turns were not its own, and reasoning signed by the old
+model is no longer replayed.
+
+In the middle of a turn the change is made at the session's next step: the request in flight
+finishes where it was sent, what it asked for is done, and the next request goes to the new model.
+Subagents at work on the model the session had change with it, each at its own next step; one that
+was given a model of its own keeps it. This is how a goal's model is changed, since a goal is
+nearly always in the middle of a turn. `/usage` shows what each model was used for.
+
+From the shell: `narsil sessions model <session or goal id> <provider/model-id>`, or
+`narsil run --session <id> --model <provider/model-id> "..."` to change it and say something.
 
 ## Permissions and sudo
 

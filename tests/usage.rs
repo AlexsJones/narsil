@@ -226,3 +226,58 @@ fn each_backends_way_of_reporting_usage_arrives_as_the_same_numbers() {
     assert!(estimated);
     assert!(receipt.starts_with("(1 call · ~") && receipt.contains(" in · ~"), "{receipt}");
 }
+
+#[test]
+fn a_model_changed_in_the_middle_of_a_turn_takes_over_at_the_next_step() {
+    let narsil = Narsil::new();
+    let dir = narsil.dir("x");
+    // A turn of four requests to the model, with a pause before the third, and a subagent
+    // that is at work across the change.
+    let turn = script(&[
+        "!bash echo one",
+        r#"!tool spawn_agents {"agents":[{"name":"helper","task":"!bash echo a ~~ !after 3 !bash echo b ~~ !say The helper is done."}]}"#,
+        "!bash echo three",
+        "!say Done.",
+    ]);
+    narsil.start();
+    let running = narsil.begin(&dir, &["run", "--auto", &turn]);
+    // While the subagent waits on its model, the session is handed to another.
+    narsil.wait("the subagent to be at work", || sum(&narsil, "COUNT(*)", "session_id != root_id") >= 1);
+    let root = narsil.text("SELECT id FROM sessions WHERE parent_id IS NULL", &[]);
+    let said = narsil.ok(&dir, &["sessions", "model", &root, "mock/second"]);
+    assert!(said.contains("takes over at its next step"), "{said}");
+    // Not yet: the request in flight and what it asked for are finished first.
+    assert_eq!(narsil.text("SELECT model FROM sessions WHERE id = ?1", &[&root]), "mock/mock");
+    let out = running.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // Each request, in order, with the model it went to: the first two of the session's on the
+    // old one, the rest on the new one; and the subagent's own, the same way.
+    let calls = |whose: &str| narsil.column(&format!("SELECT model FROM model_usage WHERE {whose} ORDER BY id"), &[]);
+    assert_eq!(calls("session_id = root_id"), vec!["mock", "mock", "second", "second"]);
+    // The subagent was in the middle of its second request when the change came: that one finishes
+    // where it was sent, and its next goes to the new model, while the session still waits on it.
+    assert_eq!(calls("session_id != root_id"), vec!["mock", "mock", "second"]);
+    assert_eq!(narsil.column("SELECT model FROM sessions ORDER BY created_at, rowid", &[]), vec!["mock/second", "mock/second"]);
+
+    // The transcript says where the change came, after the results the old model had asked for.
+    let notes = narsil.column(
+        "SELECT substr(blocks, 1, 400) FROM messages WHERE session_id = ?1 AND kind = 'note' AND blocks LIKE '%model for this conversation changed%'",
+        &[&root],
+    );
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("from mock/mock to mock/second"), "{notes:?}");
+    let order = narsil.column("SELECT role || ':' || kind FROM messages WHERE session_id = ?1 ORDER BY id", &[&root]);
+    let at = order.iter().position(|m| m == "user:note").unwrap();
+    assert_eq!(order[at - 1], "user:message", "the note is not after the tool results: {order:?}");
+
+    // And `narsil usage` has both models.
+    let report = usage(&narsil);
+    let models: Vec<&str> = report["by_model"].as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap()).collect();
+    assert_eq!(models, vec!["mock/mock", "mock/second"]);
+
+    // Between turns, a change is made at once.
+    let said = narsil.ok(&dir, &["sessions", "model", &root, "mock/third"]);
+    assert!(said.contains("now uses mock/third"), "{said}");
+    assert_eq!(narsil.text("SELECT model FROM sessions WHERE id = ?1", &[&root]), "mock/third");
+}

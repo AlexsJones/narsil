@@ -392,8 +392,9 @@ async fn handle(
         }
         Command::SetModel { session, model } => {
             let id = store.resolve_session(&session)?;
-            engine.switch_model(&id, model.trim())?;
-            Ok(Value::Null)
+            // Mid-turn, the change is taken up at the session's next step.
+            let now = engine.switch_model(&id, model.trim())?;
+            Ok(json!({ "deferred": !now }))
         }
         Command::WorkClear { cwd } => {
             let dropped = engine.clear_work(&cwd)?;

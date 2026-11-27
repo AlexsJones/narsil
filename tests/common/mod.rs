@@ -167,6 +167,11 @@ impl Narsil {
         c
     }
 
+    /// Start a narsil command and leave it running: for a turn that something is to be done during.
+    pub fn begin(&self, cwd: &Path, args: &[&str]) -> std::process::Child {
+        self.command(cwd, args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("starting narsil")
+    }
+
     /// Run a narsil command and return what it printed, whether or not it succeeded.
     pub fn try_run(&self, cwd: &Path, args: &[&str]) -> (bool, String) {
         let out = self.command(cwd, args).output().expect("running narsil");

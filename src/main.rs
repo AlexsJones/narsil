@@ -235,6 +235,13 @@ enum SessionsCmd {
     Show { id: String },
     /// Delete a session and its subagents
     Rm { id: String },
+    /// Hand a session (or a goal's) to another model: at once, or at its next step if it is at work
+    Model {
+        /// A session or goal id
+        id: String,
+        /// provider/model-id
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -737,6 +744,19 @@ async fn cmd_sessions(paths: &Paths, cmd: SessionsCmd) -> Result<()> {
                         _ => {}
                     }
                 }
+            }
+        }
+        SessionsCmd::Model { id, model } => {
+            // A goal's id stands for the session that works on it.
+            let id = match store.resolve_goal(&id) {
+                Ok(goal) => store.goal_get(&goal)?.and_then(|g| g.session_id).ok_or_else(|| anyhow!("goal {goal} has not started a session yet"))?,
+                Err(_) => store.resolve_session(&id)?,
+            };
+            let conn = client::Conn::connect_or_start(paths).await?;
+            let said = conn.call(proto::Command::SetModel { session: id.clone(), model: model.clone() }).await?;
+            match said["deferred"] == true {
+                true => println!("session {id} is at work: {model} takes over at its next step"),
+                false => println!("session {id} now uses {model}"),
             }
         }
         SessionsCmd::Rm { id } => {

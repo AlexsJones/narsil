@@ -113,6 +113,8 @@ pub struct Engine {
     unplanned: Mutex<HashMap<String, u32>>,
     /// The kinds of credential, and the credential stores, a session has already been told how to handle.
     handled: Mutex<HashMap<String, HashSet<String>>>,
+    /// Models asked for while a session was in the middle of a turn: taken up at its next step.
+    pending_models: Mutex<HashMap<String, String>>,
     shutting_down: AtomicBool,
 }
 
@@ -309,6 +311,7 @@ impl Engine {
             stumbles: Mutex::new(HashMap::new()),
             unplanned: Mutex::new(HashMap::new()),
             handled: Mutex::new(HashMap::new()),
+            pending_models: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -402,16 +405,81 @@ impl Engine {
     }
 
     /// Hand a session to another model, between turns.
-    pub fn switch_model(&self, sid: &str, model: &str) -> Result<()> {
+    /// Hand a session to another model. Between turns that is done at once
+    /// (`true`). In the middle of one it is done at the session's next step
+    /// (`false`): the request to the model that is in flight finishes, what
+    /// it asked for is done, and the next request goes to the new model. A
+    /// goal is nearly always in the middle of a turn, so this is how its
+    /// model is changed at all.
+    pub fn switch_model(&self, sid: &str, model: &str) -> Result<bool> {
         self.validate_model(model)?;
         let session = self.store.require_session(sid)?;
         if self.is_running(sid) {
-            bail!("the session is busy; change the model between turns");
+            let mut pending = self.pending_models.lock().unwrap_or_else(|e| e.into_inner());
+            let text = if session.model == model {
+                // Changed back before the change was taken up: by it, or by any subagent of its.
+                pending.remove(sid);
+                for agent in self.store.subagents(&session.root_id)? {
+                    pending.remove(&agent.id);
+                }
+                format!("the model stays {model}")
+            } else {
+                pending.insert(sid.to_string(), model.to_string());
+                format!("the model changes to {model} at the next step")
+            };
+            drop(pending);
+            if session.model != model {
+                // Its subagents are at work while it waits on them: they change at their own next step.
+                self.carry_to_subagents(&session, model)?;
+            }
+            self.emit(&session, Event::Notice { level: "info".into(), text });
+            return Ok(false);
         }
+        self.pending_models.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
+        self.apply_model(&session, model)?;
+        Ok(true)
+    }
+
+    /// Take up a change of model that was asked for in the middle of a turn.
+    /// Called where the transcript is whole: before a request to the model,
+    /// and when a run ends.
+    fn take_model_change(&self, sid: &str) -> Result<()> {
+        let Some(model) = self.pending_models.lock().unwrap_or_else(|e| e.into_inner()).remove(sid) else {
+            return Ok(());
+        };
+        let session = self.store.require_session(sid)?;
+        tracing::info!(session = %session.id, from = %session.model, to = %model, "the model changed in the middle of a turn");
+        self.apply_model(&session, &model)
+    }
+
+    /// The subagents of a session that are on the model it has (`session` as it was before the
+    /// change) go with it to another: those at work at their own next step, those waiting to
+    /// start from the start. One that was given a model of its own keeps it.
+    fn carry_to_subagents(&self, session: &Session, model: &str) -> Result<()> {
+        let agents = self.store.subagents(&session.root_id)?;
+        for agent in agents.iter().filter(|a| a.parent == session.id) {
+            let Some(child) = self.store.get_session(&agent.id)? else { continue };
+            if child.model != session.model {
+                continue;
+            }
+            // Whether one is at work is the engine's to say; the record only has whether it has started.
+            if self.is_running(&child.id) {
+                self.pending_models.lock().unwrap_or_else(|e| e.into_inner()).insert(child.id.clone(), model.to_string());
+                self.carry_to_subagents(&child, model)?;
+            } else if agent.state == "queued" {
+                self.apply_model(&child, model)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_model(&self, session: &Session, model: &str) -> Result<()> {
+        let sid = session.id.as_str();
         if session.model == model {
             return Ok(());
         }
         self.store.switch_model(sid, model)?;
+        self.carry_to_subagents(session, model)?;
         if self.store.message_count(sid)? > 0 {
             // In the transcript, so the new model knows the earlier turns were not its own.
             let note = [Block::Text {
@@ -422,9 +490,9 @@ impl Engine {
                 ),
             }];
             let msg = self.store.append_message(sid, Role::User, MsgKind::Note, &note)?;
-            self.emit(&session, Event::Message { msg });
+            self.emit(session, Event::Message { msg });
         }
-        self.emit(&session, Event::SessionChanged);
+        self.emit(session, Event::SessionChanged);
         Ok(())
     }
 
@@ -1093,6 +1161,10 @@ impl Engine {
                     }
                 }
                 this.unregister(&session, state);
+                // A change of model asked for after the last request of the run: for the next one.
+                if let Err(e) = this.take_model_change(&session.id) {
+                    tracing::warn!(session = %session.id, "the change of model was not taken up: {e:#}");
+                }
                 result
             }
             .instrument(span)
@@ -1311,6 +1383,8 @@ impl Engine {
     /// One model call: assemble context, stream the reply, store it.
     async fn model_step(self: &Arc<Self>, s0: &Session, cancel: &CancellationToken) -> Result<Step> {
         let cfg = self.cfg();
+        // A change of model asked for since the last step: this request is the first to go to it.
+        self.take_model_change(&s0.id)?;
         let mut session = self.store.require_session(&s0.id)?;
         let (pname, model_id) = {
             let (p, m) = split_model_ref(&session.model);

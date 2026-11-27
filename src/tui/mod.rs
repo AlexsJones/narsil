@@ -2106,7 +2106,12 @@ impl App {
             Target::Session => match self.sid() {
                 Some(sid) => match self.conn.call(Command::SetModel { session: sid, model: model.clone() }).await {
                     // The transcript records the change; the status line shows the new model.
-                    Ok(_) => self.refresh_session().await,
+                    Ok(said) => {
+                        if said["deferred"] == true {
+                            self.flash(format!("{model} takes over at the next step"));
+                        }
+                        self.refresh_session().await
+                    }
                     Err(e) => self.error(format!("{e:#}")),
                 },
                 None => {

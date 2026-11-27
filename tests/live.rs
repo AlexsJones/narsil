@@ -215,3 +215,45 @@ fn asked_which_local_model_suits_agent_work_it_asks_llmfit_and_answers_from_what
     let said = asked.said.to_lowercase();
     assert!(put_forward.iter().any(|name| said.contains(name)), "it named none of what llmfit put forward ({put_forward:?}): {}", asked.said);
 }
+
+#[test]
+#[ignore = "calls two real models"]
+fn a_turn_handed_to_another_model_in_the_middle_carries_on_with_it() {
+    // The model the turn starts on is the usual one; the one it is handed to is named by
+    // NARSIL_LIVE_OTHER_PROVIDER, NARSIL_LIVE_OTHER_MODEL and NARSIL_LIVE_OTHER_KEY_ENV.
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| panic!("{name} is not set"));
+    let first = format!("{}/{}", var("NARSIL_LIVE_PROVIDER"), var("NARSIL_LIVE_MODEL"));
+    let (provider, model, key) = (var("NARSIL_LIVE_OTHER_PROVIDER"), var("NARSIL_LIVE_OTHER_MODEL"), var("NARSIL_LIVE_OTHER_KEY_ENV"));
+    let second = format!("{provider}/{model}");
+    let narsil = Narsil::live(|_, _| {});
+    let dir = narsil.dir("chat");
+    narsil.ok(&dir, &["setup", "--yes", "--provider", &provider, "--model", &model, "--api-key-env", &key, "--no-test"]);
+    narsil.start();
+
+    let asked = "Do these three things one at a time, each as its own shell command, waiting for each to finish before the next: \
+                 1. `sleep 8; echo one`  2. `sleep 1; echo two`  3. `echo three`. Then tell me the three words that were printed.";
+    let running = narsil.begin(&dir, &["run", "--auto", "--model", &first, asked]);
+    // Its first request has been answered and the first command is running: now the change.
+    narsil.wait_up_to(Duration::from_secs(60), "the first request to be answered", || {
+        narsil.text("SELECT COUNT(*) FROM model_usage", &[]).parse::<i64>().unwrap_or(0) >= 1
+    });
+    let root = narsil.text("SELECT id FROM sessions WHERE parent_id IS NULL", &[]);
+    let said = narsil.ok(&dir, &["sessions", "model", &root, &second]);
+    println!("{first} -> {second}: {}", said.trim());
+    let out = running.wait_with_output().unwrap();
+    let (printed, errors) = (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string());
+    println!("  said: {}\n  {}", printed.trim().replace('\n', "\n    "), errors.trim().replace('\n', "\n  "));
+    assert!(out.status.success(), "the turn did not finish after the change:\n{errors}");
+
+    // Each request with where it went, in order: the first model, then only the second.
+    let went = narsil.column("SELECT provider || '/' || model FROM model_usage ORDER BY id", &[]);
+    println!("  requests went to: {}", went.join(", "));
+    let changed = went.iter().position(|m| *m == second).unwrap_or_else(|| panic!("no request went to {second}: {went:?}"));
+    assert!(changed >= 1 && went[..changed].iter().all(|m| *m == first) && went[changed..].iter().all(|m| *m == second), "{went:?}");
+    assert_eq!(narsil.text("SELECT model FROM sessions WHERE id = ?1", &[&root]), second);
+    // And the work was carried through by the second model, with what the first had done in front of it.
+    let low = printed.to_lowercase();
+    assert!(low.contains("one") && low.contains("two") && low.contains("three"), "{printed}");
+    let ran = narsil.column("SELECT input FROM tool_calls WHERE name = 'bash' ORDER BY rowid", &[]);
+    assert!(ran.iter().filter(|c| c.contains("echo")).count() >= 3, "{ran:?}");
+}
