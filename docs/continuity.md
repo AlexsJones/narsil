@@ -62,8 +62,12 @@ So that you can tell which you have started:
   `∞ no finish line: it works until you stop it`.
 - `narsil goal list` marks it `[open-ended, runs until stopped]`, and a notice says so when the agent
   declares it.
-- An open-ended goal pauses after an hour (`[goals] open_ended_hours`), so that going on is something
-  you chose: `narsil goal resume <id>` gives it another.
+- In the TUI a window asks how long it may work, the moment it turns out to have no end: 30 minutes,
+  an hour, three hours, three or ten more turns, until you stop it, or pause it now. `/budget` brings
+  the window back, and it comes back by itself when what you gave runs out. From the shell:
+  `narsil goal limit <id> 30m` (or `2h`, `5t` for turns, `none`).
+- Left unanswered, an open-ended goal pauses after an hour (`[goals] open_ended_hours`), so that
+  going on is something you chose.
 
 ### What a goal is allowed
 

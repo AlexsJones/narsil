@@ -156,7 +156,7 @@ Slash commands complete as you type: the rest of the best match shows dimmed, ta
 takes it, and more tabs walk through the others. After `/cd`, tab completes folder names the same way.
 
 `/new` `/clear` `/sessions` `/resume <id>` `/continue` `/compact` `/goal <objective>` `/goals`
-`/pause` `/cleargoal` `/agents` `/back` `/cd <dir>` `/files` `/panel` `/model [text]`
+`/pause` `/budget` `/cleargoal` `/agents` `/back` `/cd <dir>` `/files` `/panel` `/model [text]`
 `/provider [name]` `/memory [query]` `/remember <text>` `/forget <id>` `/trace` `/stats` `/usage`
 `/logs [errors]` `/theme [name]` `/keys` `/auto` `/ask` `/reload` `/daemonrestart` `/title <text>`
 `/help`.

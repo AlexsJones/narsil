@@ -92,3 +92,37 @@ fn small_steps_taken_one_request_at_a_time_are_pointed_out_once_a_run() {
     let len = big.calls_to("bash")[0].result.len();
     assert!((8_000..=13_000).contains(&len), "{len}");
 }
+
+#[test]
+fn what_the_user_gives_an_open_ended_goal_is_what_it_gets() {
+    // Left to the configuration it would be paused in about a second; told to go on until stopped, it is not.
+    let narsil = Narsil::with(|_, config| {
+        config.set("goals", "open_ended_hours", "0.0003");
+        // The stand-in runs out of things to do; that is not what is being looked at here.
+        config.set("goals", "stall_limit", "0");
+    });
+    let dir = narsil.dir("site");
+    let turn = script(&[r#"!tool goal_define {"open_ended":true,"done_when":[]}"#, "!bash sleep 1", "!say More could be done."]);
+    let goal = narsil.goal(&dir, &turn);
+    let said = narsil.ok(&dir, &["goal", "limit", &goal, "none"]);
+    assert!(said.contains("until you stop it"), "{said}");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(narsil.text("SELECT status FROM goals WHERE id = ?1", &[&goal]), "active");
+
+    // Given two more turns, it has those and then waits to be told how many more.
+    let turns: i64 = narsil.text("SELECT iterations FROM goals WHERE id = ?1", &[&goal]).parse().unwrap();
+    let said = narsil.ok(&dir, &["goal", "limit", &goal, "2t"]);
+    assert!(said.contains("turn"), "{said}");
+    narsil.goal_reaches(&goal, &["paused"]);
+    let (note, after): (String, i64) =
+        (narsil.text("SELECT note FROM goals WHERE id = ?1", &[&goal]), narsil.text("SELECT iterations FROM goals WHERE id = ?1", &[&goal]).parse().unwrap());
+    assert!(note.contains("the turns you gave it are used"), "{note}");
+    assert!((turns + 1..=turns + 3).contains(&after), "{turns} then {after}");
+
+    // Giving a paused goal more sets it going again; a limit that cannot be read is refused.
+    narsil.ok(&dir, &["goal", "limit", &goal, "30m"]);
+    assert_eq!(narsil.text("SELECT status FROM goals WHERE id = ?1", &[&goal]), "active");
+    assert!(narsil.text("SELECT limit_until - strftime('%s','now') FROM goals WHERE id = ?1", &[&goal]).parse::<i64>().unwrap() > 1700);
+    let (fine, said) = narsil.try_run(&dir, &["goal", "limit", &goal, "soon"]);
+    assert!(!fine && said.contains("30m, 2h, 5t"), "{said}");
+}

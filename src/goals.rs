@@ -172,7 +172,19 @@ async fn drive(engine: &Arc<Engine>, goal_id: &str, cancel: &CancellationToken) 
             engine.set_goal_status(goal_id, "paused", &format!("time budget reached ({} h)", cfg.goals.max_hours))?;
             return Ok(());
         }
-        if goal.open_ended() && cfg.goals.open_ended_hours > 0.0 && ran > cfg.goals.open_ended_hours * 3600.0 {
+        // What the user gave this goal comes before what the configuration gives every goal.
+        if goal.limit_until > 0 && now() >= goal.limit_until {
+            engine.store.goal_set_limits(goal_id, 0, 0)?;
+            engine.set_goal_status(goal_id, "paused", "the time you gave it is up: resume it, and say how much longer")?;
+            return Ok(());
+        }
+        if goal.limit_turn > 0 && goal.iterations >= goal.limit_turn {
+            engine.store.goal_set_limits(goal_id, 0, 0)?;
+            engine.set_goal_status(goal_id, "paused", "the turns you gave it are used: resume it, and say how many more")?;
+            return Ok(());
+        }
+        let unsaid = goal.limit_until == 0 && goal.limit_turn == 0;
+        if goal.open_ended() && unsaid && cfg.goals.open_ended_hours > 0.0 && ran > cfg.goals.open_ended_hours * 3600.0 {
             let note = format!(
                 "this objective has no finish line, and it has worked for {} h: resume it to let it go on, or give it a goal with an end",
                 cfg.goals.open_ended_hours

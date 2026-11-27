@@ -447,6 +447,27 @@ async fn handle(
         Command::GoalAction { id, action } => {
             let id = store.resolve_goal(&id)?;
             let goal = store.goal_get(&id)?.ok_or_else(|| anyhow!("no such goal"))?;
+            // `limit 30m`, `limit 2h`, `limit 5t` (turns from here), `limit none` (until stopped).
+            if let Some(given) = action.strip_prefix("limit ") {
+                let given = given.trim();
+                let amount = |unit: char| given.strip_suffix(unit).and_then(|n| n.trim().parse::<f64>().ok()).filter(|n| *n > 0.0);
+                let (until, turn) = match given {
+                    "none" => (-1, 0),
+                    _ => match (amount('m'), amount('h'), amount('t')) {
+                        (Some(m), _, _) => (crate::util::now() + (m * 60.0) as i64, 0),
+                        (_, Some(h), _) => (crate::util::now() + (h * 3600.0) as i64, 0),
+                        (_, _, Some(t)) => (-1, goal.iterations + t as i64),
+                        _ => bail!("a limit is written 30m, 2h, 5t (turns) or none, not {given:?}"),
+                    },
+                };
+                store.goal_set_limits(&id, until, turn)?;
+                if goal.status == "paused" {
+                    engine.set_goal_status(&id, "active", "resumed by the user")?;
+                } else if let Some(goal) = store.goal_get(&id)? {
+                    engine.emit_global(Event::Goal { goal });
+                }
+                return Ok(json!({ "goal": store.goal_get(&id)? }));
+            }
             let (status, note) = match action.as_str() {
                 "pause" => ("paused", "paused by the user"),
                 "resume" => ("active", "resumed by the user"),

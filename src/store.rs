@@ -478,6 +478,12 @@ pub struct Goal {
     /// When it was last set going again after a pause: budgets count from here.
     #[serde(default)]
     pub resumed_at: i64,
+    /// What the user gave it: the moment to stop at (unix seconds; -1: no limit of time at all,
+    /// whatever the configuration says; 0: not said), and the turn to stop after (0: not said).
+    #[serde(default)]
+    pub limit_until: i64,
+    #[serde(default)]
+    pub limit_turn: i64,
 }
 
 impl Goal {
@@ -486,13 +492,32 @@ impl Goal {
         self.done_when == "open"
     }
 
+    /// What the user has given it to work with, in words; empty when they have not said.
+    pub fn allowance(&self, now: i64) -> String {
+        let mut parts = Vec::new();
+        match self.limit_until {
+            -1 => parts.push("until you stop it".to_string()),
+            until if until > 0 => parts.push(match until - now {
+                left if left <= 0 => "its time is up".to_string(),
+                left if left < 5400 => format!("{} min left", (left + 59) / 60),
+                left => format!("{:.1} h left", left as f64 / 3600.0),
+            }),
+            _ => {}
+        }
+        if self.limit_turn > 0 {
+            let left = (self.limit_turn - self.iterations).max(0);
+            parts.push(format!("{left} turn{} left", if left == 1 { "" } else { "s" }));
+        }
+        parts.join(", ")
+    }
+
     /// When the time and tokens it is allowed began to count.
     pub fn budget_from(&self) -> i64 {
         self.created_at.max(self.resumed_at)
     }
 }
 
-const GOAL_COLS: &str = "id, objective, cwd, model, status, note, session_id, iterations, created_at, updated_at, done_when, resumed_at";
+const GOAL_COLS: &str = "id, objective, cwd, model, status, note, session_id, iterations, created_at, updated_at, done_when, resumed_at, limit_until, limit_turn";
 
 fn goal_from(row: &Row) -> rusqlite::Result<Goal> {
     Ok(Goal {
@@ -508,6 +533,8 @@ fn goal_from(row: &Row) -> rusqlite::Result<Goal> {
         updated_at: row.get(9)?,
         done_when: row.get(10)?,
         resumed_at: row.get(11)?,
+        limit_until: row.get(12)?,
+        limit_turn: row.get(13)?,
     })
 }
 
@@ -604,6 +631,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("memories", "pending", "INTEGER NOT NULL DEFAULT 0"),
         ("goals", "done_when", "TEXT NOT NULL DEFAULT ''"),
         ("goals", "resumed_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("goals", "limit_until", "INTEGER NOT NULL DEFAULT 0"),
+        ("goals", "limit_turn", "INTEGER NOT NULL DEFAULT 0"),
     ];
     for (table, column, decl) in added {
         let present: bool = conn
@@ -1480,6 +1509,12 @@ impl Store {
     /// Write down what a goal is done when (`open`: nothing; it works until stopped).
     pub fn goal_set_done_when(&self, id: &str, done_when: &str) -> Result<()> {
         self.db().execute("UPDATE goals SET done_when = ?2, updated_at = ?3 WHERE id = ?1", params![id, done_when, now()])?;
+        Ok(())
+    }
+
+    /// What the user gives a goal to work with: a moment to stop at and a turn to stop after.
+    pub fn goal_set_limits(&self, id: &str, until: i64, turn: i64) -> Result<()> {
+        self.db().execute("UPDATE goals SET limit_until = ?2, limit_turn = ?3, updated_at = ?4 WHERE id = ?1", params![id, until, turn, now()])?;
         Ok(())
     }
 

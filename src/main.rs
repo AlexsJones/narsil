@@ -266,6 +266,9 @@ enum GoalCmd {
     Pause { id: String },
     Resume { id: String },
     Cancel { id: String },
+    /// Say how long a goal may work: 30m, 2h, 5t (turns from here), or none (until you stop it).
+    /// A paused goal is set going again.
+    Limit { id: String, limit: String },
 }
 
 #[derive(Subcommand)]
@@ -838,6 +841,12 @@ async fn cmd_goal(paths: &Paths, cmd: GoalCmd) -> Result<()> {
         GoalCmd::Pause { id } => goal_action(paths, &id, "pause", "paused").await?,
         GoalCmd::Resume { id } => goal_action(paths, &id, "resume", "active").await?,
         GoalCmd::Cancel { id } => goal_action(paths, &id, "cancel", "cancelled").await?,
+        GoalCmd::Limit { id, limit } => {
+            let conn = client::Conn::connect_or_start(paths).await?;
+            let said = conn.call(proto::Command::GoalAction { id: id.clone(), action: format!("limit {limit}") }).await?;
+            let goal: store::Goal = serde_json::from_value(said["goal"].clone())?;
+            println!("goal {} may work {}", goal.id, goal.allowance(util::now()));
+        }
     }
     Ok(())
 }

@@ -22,6 +22,7 @@ pub const COMMANDS: &[Cmd] = &[
     cmd("/cd", "<directory>", "move this session to another directory"),
     cmd("/sessions", "", "pick a session to resume"),
     cmd("/stats", "", "time and tokens in this session"),
+    cmd("/budget", "", "how long a goal with no finish line may work"),
     cmd("/usage", "", "tokens used: by request, by model, and what a call carries"),
     cmd("/trace", "", "the tree of what was done"),
     cmd("/title", "<text>", "rename this session"),

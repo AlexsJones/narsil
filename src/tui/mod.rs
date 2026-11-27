@@ -141,9 +141,22 @@ enum Overlay {
     Text { title: String, lines: Vec<String>, scroll: usize },
     /// What the session did, step by step: its state is in `App::trace`.
     Trace,
+    /// How long a goal with no finish line may work: asked when it turns out to have none.
+    Budget { goal: String, sel: usize },
     /// The themes, the one under the selection in force as it is moved over, and the one to go back to.
     Themes { sel: usize, before: String },
 }
+
+/// What can be given to a goal with no finish line: what is shown, and the action that gives it.
+const BUDGETS: [(&str, &str); 7] = [
+    ("30 minutes", "limit 30m"),
+    ("1 hour", "limit 1h"),
+    ("3 hours", "limit 3h"),
+    ("3 more turns", "limit 3t"),
+    ("10 more turns", "limit 10t"),
+    ("until I stop it", "limit none"),
+    ("pause it now", "pause"),
+];
 
 /// The /trace window: the recorded steps, which runs are shut, and where the cursor is.
 struct TraceView {
@@ -363,6 +376,8 @@ struct App {
     logs: Option<LogView>,
     /// The /trace window, while it is open.
     trace: Option<TraceView>,
+    /// The goals (and the state they were in) that the budget window has been shown for.
+    budget_asked: std::collections::HashSet<String>,
     /// The Obsidian vault: None when none is set, else whether it can be reached, and when that was last checked.
     vault: Option<(bool, Instant)>,
     bg_tx: mpsc::UnboundedSender<Bg>,
@@ -917,6 +932,7 @@ impl App {
             work_cleared: Default::default(),
             logs: None,
             trace: None,
+            budget_asked: Default::default(),
             vault: None,
             bg_tx,
             keys,
@@ -1276,6 +1292,14 @@ impl App {
                     let line = format!("goal {} is {}{}", goal.id, goal.status, if goal.note.is_empty() { String::new() } else { format!(": {}", first_line(&goal.note, 200)) });
                     if mine {
                         self.note(line);
+                        // No finish line, and nothing said yet about how long it may go on (or what
+                        // was given has run out): ask, once each time.
+                        let unsaid = goal.limit_until == 0 && goal.limit_turn == 0;
+                        let ask = goal.open_ended() && unsaid && matches!(goal.status.as_str(), "active" | "paused") && goal.note != "paused by the user";
+                        let key = format!("{} {}", goal.id, goal.status);
+                        if ask && matches!(self.overlay, Overlay::None) && self.budget_asked.insert(key) {
+                            self.overlay = Overlay::Budget { goal: goal.id.clone(), sel: 1 };
+                        }
                         self.goal = Some(goal);
                     } else {
                         self.flash(line);
@@ -2391,6 +2415,10 @@ impl App {
                 self.overlay = Overlay::Text { title: "help".into(), lines: HELP.lines().map(str::to_string).collect(), scroll: 0 }
             }
             "/quit" | "/exit" | "/q" => self.quit = true,
+            "/budget" => match &self.goal {
+                Some(g) if !matches!(g.status.as_str(), "completed" | "cancelled") => self.overlay = Overlay::Budget { goal: g.id.clone(), sel: 1 },
+                _ => self.flash("there is no goal at work in this session"),
+            },
             "/cleargoal" => {
                 // The slate clean: what is unfinished in this directory's plan is dropped, a goal
                 // this session is working on is cancelled, and the panel forgets what it was showing.
@@ -3023,6 +3051,12 @@ impl App {
                 KeyCode::Enter => self.overlay = Overlay::None,
                 _ => {}
             },
+            Overlay::Budget { goal, sel } => match code {
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1).min(BUDGETS.len() - 1),
+                KeyCode::Enter => goal_action = Some((goal.clone(), BUDGETS[*sel].1)),
+                _ => {}
+            },
             // The themes and the trace have their keys taken above.
             Overlay::None | Overlay::Themes { .. } | Overlay::Trace => {}
         }
@@ -3047,6 +3081,14 @@ impl App {
         }
         if let Some((id, action)) = goal_action {
             match self.conn.call(Command::GoalAction { id, action: action.into() }).await {
+                Ok(said) if matches!(self.overlay, Overlay::Budget { .. }) => {
+                    self.overlay = Overlay::None;
+                    let goal: Option<Goal> = serde_json::from_value(said["goal"].clone()).ok();
+                    self.flash(match goal.map(|g| g.allowance(now())).filter(|a| !a.is_empty()) {
+                        Some(allowed) if action != "pause" => format!("the goal may work: {allowed}"),
+                        _ => "the goal is paused".to_string(),
+                    });
+                }
                 Ok(_) => self.open_goals(),
                 Err(e) => self.flash(format!("{e:#}")),
             }
@@ -3249,8 +3291,12 @@ impl App {
             // Where it ends, as the agent set it out: or that it does not, and so goes on until stopped.
             if g.open_ended() && g.status != "completed" {
                 let hours = self.cfg.goals.open_ended_hours;
-                let pause = if hours > 0.0 { format!(", or pauses after {hours} h") } else { String::new() };
-                let mut open = row(format!("no finish line: it works until you stop it (/pause){pause}"), "∞", Style::new().fg(Color::Yellow), 0);
+                let text = match g.allowance(now()) {
+                    given if !given.is_empty() => format!("no finish line: {given} (/budget to change)"),
+                    _ if hours > 0.0 => format!("no finish line: it works until you stop it, or pauses after {hours} h (/budget)"),
+                    _ => "no finish line: it works until you stop it (/budget)".to_string(),
+                };
+                let mut open = row(text, "∞", Style::new().fg(Color::Yellow), 0);
                 open.mark_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
                 rows.push(open);
             } else if !g.done_when.is_empty() && !g.open_ended() {
@@ -3927,6 +3973,12 @@ impl App {
         }
         let (title, lines, sel, hint): (String, Vec<String>, Option<usize>, &str) = match &self.overlay {
             Overlay::None | Overlay::Themes { .. } | Overlay::Trace => return,
+            Overlay::Budget { sel, .. } => (
+                "this goal has no finish line: how long may it work?".into(),
+                BUDGETS.iter().map(|(shown, _)| shown.to_string()).collect(),
+                Some(*sel),
+                "↑↓ enter · esc leave it as it is · /budget to come back",
+            ),
             Overlay::Sessions { list, sel } => (
                 "sessions".into(),
                 list.iter()
