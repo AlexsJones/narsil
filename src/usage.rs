@@ -301,6 +301,28 @@ fn bar(parts: &[(&'static str, i64)], width: usize) -> String {
     cells.iter().enumerate().map(|(i, n)| FILLS[i % FILLS.len()].to_string().repeat(*n)).collect()
 }
 
+/// The report laid out for a window: a line that begins `# ` is a heading, and one
+/// that begins `~ ` is the names of the columns under it or a note.
+pub fn window(r: &Report, width: usize) -> Vec<String> {
+    let width = width.saturating_sub(2);
+    let mut out = vec!["# this session and its subagents".to_string()];
+    for line in lines(r, width) {
+        let heading = ["by model", "by request"].iter().find(|h| line.starts_with(**h));
+        if let Some(h) = heading {
+            out.push(format!("# {h}"));
+            out.push(format!("~ {}{}", " ".repeat(h.len()), &line[h.len()..]));
+        } else if let Some(rest) = line.strip_prefix("what a call carries now") {
+            out.push("# what a call carries now".to_string());
+            out.push(format!("~ {}", rest.trim_start_matches(": ")));
+        } else if line.trim_start().starts_with("calls ") || line.starts_with("of the input") || line.starts_with("largest tool results") || line.starts_with('~') {
+            out.push(format!("~ {}", line.trim_start_matches("~ ")));
+        } else {
+            out.push(line);
+        }
+    }
+    out
+}
+
 /// The report as lines of text, for a window `width` columns wide.
 pub fn lines(r: &Report, width: usize) -> Vec<String> {
     let mut out = Vec::new();

@@ -846,6 +846,17 @@ impl Store {
         )?)
     }
 
+    /// A tool call by its id: (the tool, what it was called with, what came back, whether that was a failure).
+    pub fn tool_call(&self, call: &str) -> Result<Option<(String, Value, Option<String>, bool)>> {
+        Ok(self
+            .db()
+            .query_row("SELECT name, input, result, is_error FROM tool_calls WHERE id = ?1", params![call], |r| {
+                let input: String = r.get(1)?;
+                Ok((r.get(0)?, serde_json::from_str(&input).unwrap_or(Value::Null), r.get(2)?, r.get::<_, i64>(3)? != 0))
+            })
+            .optional()?)
+    }
+
     /// The messages with these ids, as their stored blocks.
     pub fn message_blocks(&self, ids: &[i64]) -> Result<Vec<(i64, String)>> {
         let db = self.db();

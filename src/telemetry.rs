@@ -965,6 +965,40 @@ fn by_session(spans: &[SpanRow], now: i64) -> Vec<String> {
     out
 }
 
+/// The totals laid out for a window: one fact to a line under headings, and the
+/// tables each under its own. A line that begins `# ` is a heading; one that
+/// begins `~ ` is the names of the columns under it.
+pub fn stats_window(spans: &[SpanRow], now: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut lines = stats(spans, now).into_iter().peekable();
+    // The summary: each fact on a line of its own.
+    out.push("# in all".to_string());
+    while let Some(line) = lines.next_if(|l| !l.is_empty()) {
+        match line.split_once(": ") {
+            // A list (what failed, what is in flight, the slowest), one to a line under its name.
+            Some((name, list)) if ["slowest", "in flight"].contains(&name) || name.ends_with("failed") => {
+                out.push(String::new());
+                out.push(format!("# {name}"));
+                out.extend(list.split("; ").map(|item| format!("  {item}")));
+            }
+            _ => out.extend(line.split(" \u{00b7} ").map(|fact| format!("  {fact}"))),
+        }
+    }
+    // The tables: by session, by model, by tool.
+    while let Some(line) = lines.next() {
+        if !line.is_empty() {
+            out.push(format!("  {line}"));
+            continue;
+        }
+        let Some(head) = lines.next() else { break };
+        let name = head.split_whitespace().next().unwrap_or("");
+        out.push(String::new());
+        out.push(format!("# by {name}"));
+        out.push(format!("~ {}{}", " ".repeat(name.len() + 2), &head[name.len()..]));
+    }
+    out
+}
+
 pub fn stats(spans: &[SpanRow], now: i64) -> Vec<String> {
     let mut out = summary(spans, now);
     out.extend(by_session(spans, now));

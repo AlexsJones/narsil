@@ -8,6 +8,7 @@ mod keys;
 mod models;
 mod render;
 mod theme;
+mod trace;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -138,8 +139,29 @@ enum Overlay {
     Models(Picker),
     Providers { data: Picker, sel: usize },
     Text { title: String, lines: Vec<String>, scroll: usize },
+    /// What the session did, step by step: its state is in `App::trace`.
+    Trace,
     /// The themes, the one under the selection in force as it is moved over, and the one to go back to.
     Themes { sel: usize, before: String },
+}
+
+/// The /trace window: the recorded steps, which runs are shut, and where the cursor is.
+struct TraceView {
+    spans: Vec<crate::store::SpanRow>,
+    notes: crate::telemetry::Notes,
+    folded: std::collections::HashSet<i64>,
+    /// The row the cursor is on, by the span it stands for.
+    sel: i64,
+    /// How far down the detail window has been read.
+    scroll: usize,
+    failed_only: bool,
+    /// Stay on the latest step while the session works.
+    follow: bool,
+    loaded: Instant,
+    /// Goes up each time the steps are read again, so the detail is laid out afresh.
+    version: u64,
+    /// The detail of the row under the cursor as last laid out: (row, width, version, lines).
+    detail: std::cell::RefCell<Option<(i64, usize, u64, Vec<(trace::Tone, String)>)>>,
 }
 
 /// What the /logs window is showing: how serious, whose, and holding what.
@@ -339,6 +361,8 @@ struct App {
     work_cleared: std::collections::HashSet<String>,
     /// The /logs window's filters, while it is open.
     logs: Option<LogView>,
+    /// The /trace window, while it is open.
+    trace: Option<TraceView>,
     /// The Obsidian vault: None when none is set, else whether it can be reached, and when that was last checked.
     vault: Option<(bool, Instant)>,
     bg_tx: mpsc::UnboundedSender<Bg>,
@@ -892,6 +916,7 @@ impl App {
             objective_cleared: None,
             work_cleared: Default::default(),
             logs: None,
+            trace: None,
             vault: None,
             bg_tx,
             keys,
@@ -936,6 +961,7 @@ impl App {
             self.dirty = true;
         }
         self.refresh_live_view();
+        self.refresh_trace();
     }
 
     fn busy(&self) -> bool {
@@ -1483,6 +1509,106 @@ impl App {
         });
     }
 
+    /// The rows of the /trace window as it stands.
+    fn trace_rows(&self) -> Vec<trace::Row> {
+        match &self.trace {
+            Some(v) => trace::rows(&v.spans, &v.notes, &v.folded, v.failed_only, crate::telemetry::now_ms()),
+            None => Vec::new(),
+        }
+    }
+
+    /// Read the steps again from what the daemon has recorded, keeping the cursor where it is.
+    fn trace_load(&mut self) {
+        let Some(root) = self.session.as_ref().map(|s| s.root_id.clone()) else { return };
+        let spans = self.store.spans_for_root(&root).unwrap_or_default();
+        let notes = crate::telemetry::Notes::load(&self.store, &spans);
+        let Some(view) = &mut self.trace else { return };
+        view.spans = spans;
+        view.notes = notes;
+        view.loaded = Instant::now();
+        view.version += 1;
+        let rows = self.trace_rows();
+        let Some(view) = &mut self.trace else { return };
+        if view.follow || !rows.iter().any(|r| r.id == view.sel) {
+            let to = if view.follow { rows.last() } else { rows.first() };
+            view.sel = to.map(|r| r.id).unwrap_or(0);
+            view.scroll = 0;
+        }
+        self.dirty = true;
+    }
+
+    /// Keep an open trace current while anything in it is still in hand.
+    fn refresh_trace(&mut self) {
+        let Some(view) = &self.trace else { return };
+        if !matches!(self.overlay, Overlay::Trace) {
+            self.trace = None;
+            return;
+        }
+        let in_hand = self.run_state == "running" || view.spans.iter().any(|s| s.dur_ms.is_none());
+        if in_hand && view.loaded.elapsed() >= Duration::from_millis(1000) {
+            self.trace_load();
+        }
+    }
+
+    /// A key pressed in the /trace window. Gives the session and message to go to, when enter
+    /// was pressed on a step.
+    fn trace_key(&mut self, code: KeyCode) -> Option<(String, i64)> {
+        let rows = self.trace_rows();
+        let page = (self.view_h.saturating_sub(8) / 2).max(3) as usize;
+        let view = self.trace.as_mut()?;
+        let at = rows.iter().position(|r| r.id == view.sel).unwrap_or(0);
+        let row = rows.get(at)?.clone();
+        let mut to = at;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => to = at.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => to = (at + 1).min(rows.len() - 1),
+            KeyCode::Home | KeyCode::Char('g') => to = 0,
+            KeyCode::End | KeyCode::Char('G') => to = rows.len() - 1,
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll += page,
+            KeyCode::Left | KeyCode::Char('h') if row.foldable && !row.folded => {
+                view.folded.insert(row.id);
+            }
+            // From inside a run, left goes to its heading.
+            KeyCode::Left | KeyCode::Char('h') => to = rows[..at].iter().rposition(|r| r.depth < row.depth).unwrap_or(at),
+            KeyCode::Right | KeyCode::Char('l') if row.folded => {
+                view.folded.remove(&row.id);
+            }
+            KeyCode::Enter if row.foldable && row.message == 0 => {
+                if !view.folded.remove(&row.id) {
+                    view.folded.insert(row.id);
+                }
+            }
+            KeyCode::Enter if row.message > 0 => return Some((row.session.clone(), row.message)),
+            KeyCode::Char('e') => {
+                view.failed_only = !view.failed_only;
+                view.version += 1;
+            }
+            KeyCode::Char('f') => {
+                view.follow = !view.follow;
+                if view.follow {
+                    to = rows.len() - 1;
+                }
+            }
+            _ => {}
+        }
+        if to != at {
+            view.sel = rows[to].id;
+            view.scroll = 0;
+            // Moving up from the end is choosing a step: stop following.
+            if to + 1 < rows.len() {
+                view.follow = false;
+            }
+        }
+        // After a filter, the cursor is put on something that is still there.
+        let rows = self.trace_rows();
+        let view = self.trace.as_mut()?;
+        if !rows.iter().any(|r| r.id == view.sel) {
+            view.sel = rows.first().map(|r| r.id).unwrap_or(0);
+        }
+        None
+    }
+
     /// Keep an open /trace or /stats current, about once a second while the session works.
     fn refresh_live_view(&mut self) {
         let Some((cmd, at, follow)) = self.live_view else { return };
@@ -1937,7 +2063,7 @@ impl App {
             // Read again from the database: the copy here is as old as the last event.
             let session = self.store.get_session(&self.session.as_ref()?.root_id).ok().flatten()?;
             return Some(match crate::usage::report(&self.store, &self.cfg, &session) {
-                Ok(report) => crate::usage::lines(&report, self.overlay_text_width()),
+                Ok(report) => crate::usage::window(&report, self.overlay_text_width()),
                 Err(e) => vec![format!("could not read what was used: {e}")],
             });
         }
@@ -1953,12 +2079,11 @@ impl App {
             lines.push(String::new());
             lines.extend(crate::telemetry::summary(&spans, now));
         } else {
-            lines.extend(crate::telemetry::stats(&spans, now));
+            lines.extend(crate::telemetry::stats_window(&spans, now));
             lines.push(String::new());
-            lines.push(format!(
-                "interface: last frame drawn in {} ms, slowest {} ms, {} transcript entries",
-                self.frame_ms.0, self.frame_ms.1, self.entries.len()
-            ));
+            lines.push("# the interface".to_string());
+            lines.push(format!("  last frame drawn in {} ms, slowest {} ms", self.frame_ms.0, self.frame_ms.1));
+            lines.push(format!("  {} transcript entries", self.entries.len()));
         }
         Some(lines)
     }
@@ -2519,7 +2644,30 @@ impl App {
                 self.logs = Some(LogView { min, mine: self.session.is_some(), find: String::new(), typing: false, wrap: true });
                 self.relog();
             }
-            "/trace" | "/stats" | "/usage" => {
+            "/trace" => {
+                self.logs = None;
+                self.file_view = None;
+                if self.session.is_none() {
+                    self.flash("no session open yet");
+                    return;
+                }
+                let working = self.run_state == "running";
+                self.trace = Some(TraceView {
+                    spans: Vec::new(),
+                    notes: Default::default(),
+                    folded: Default::default(),
+                    sel: 0,
+                    scroll: 0,
+                    failed_only: false,
+                    follow: working,
+                    loaded: Instant::now(),
+                    version: 0,
+                    detail: Default::default(),
+                });
+                self.trace_load();
+                self.overlay = Overlay::Trace;
+            }
+            "/stats" | "/usage" => {
                 self.logs = None;
                 self.file_view = None;
                 let cmd = match cmd {
@@ -2796,6 +2944,20 @@ impl App {
             self.overlay = Overlay::None;
             self.logs = None;
             self.file_view = None;
+            self.trace = None;
+            return;
+        }
+        if matches!(self.overlay, Overlay::Trace) {
+            // Enter on a step goes to it in the conversation: this one's, or a subagent's.
+            if let Some((session, message)) = self.trace_key(code) {
+                self.overlay = Overlay::None;
+                self.trace = None;
+                if self.sid().as_deref() != Some(session.as_str()) {
+                    self.open_agent(&session).await;
+                }
+                self.jump = Some(message);
+            }
+            self.dirty = true;
             return;
         }
         // From a file's history, enter goes to where it was last touched in the conversation.
@@ -2861,8 +3023,8 @@ impl App {
                 KeyCode::Enter => self.overlay = Overlay::None,
                 _ => {}
             },
-            // The themes have their keys taken above.
-            Overlay::None | Overlay::Themes { .. } => {}
+            // The themes and the trace have their keys taken above.
+            Overlay::None | Overlay::Themes { .. } | Overlay::Trace => {}
         }
         if let Some(id) = open {
             self.back_to = None;
@@ -3589,12 +3751,169 @@ impl App {
         f.render_widget(Paragraph::new(line), area);
     }
 
+    /// The /trace window: the steps, the whole of the one under the cursor, and where the time went.
+    fn draw_trace(&self, f: &mut Frame, area: Rect) {
+        let Some(view) = &self.trace else { return };
+        let now = crate::telemetry::now_ms();
+        let rows = self.trace_rows();
+        let w = area.width.saturating_sub(4).clamp(40, 160).min(area.width);
+        let h = area.height.saturating_sub(2).max(12).min(area.height);
+        let rect = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+        let dim = Style::new().fg(Color::DarkGray);
+        let accent = Style::new().fg(Color::LightBlue);
+        let mut hint = String::from("↑↓ step · ←→ fold · pgup/pgdn read the detail · enter go to it · e failures · f follow · esc");
+        if hint.chars().count() + 4 > w as usize {
+            hint = "↑↓ ←→ · pgup/pgdn · enter · e · f · esc".into();
+        }
+        let block = UiBlock::bordered()
+            .border_style(accent)
+            .title(format!(" trace · {} ", first_line(&trace::headline(&view.spans, now), w.saturating_sub(12) as usize)))
+            .title_bottom(format!(" {hint} "));
+        let inner = block.inner(rect);
+        f.render_widget(Clear, rect);
+        f.render_widget(block, rect);
+        if inner.height < 9 || inner.width < 30 {
+            return;
+        }
+        // Three windows: the steps, the step under the cursor, and where the time went. Side by
+        // side where there is the width for it, one above the other where there is not.
+        let strip = Rect { y: inner.y + inner.height - 3, height: 3, ..inner };
+        let body = Rect { height: inner.height - 3, ..inner };
+        let (steps, detail) = if body.width >= 116 {
+            let left = body.width * 46 / 100;
+            (Rect { width: left, ..body }, Rect { x: body.x + left, width: body.width - left, ..body })
+        } else {
+            let top = (body.height * 52 / 100).max(5);
+            (Rect { height: top, ..body }, Rect { y: body.y + top, height: body.height - top, ..body })
+        };
+
+        // The steps.
+        let at = rows.iter().position(|r| r.id == view.sel).unwrap_or(0);
+        let mut title = format!(" steps {}/{} ", if rows.is_empty() { 0 } else { at + 1 }, rows.len());
+        if view.failed_only {
+            title.push_str("· failures only ");
+        }
+        if view.follow {
+            title.push_str("· following ");
+        }
+        let steps_block = UiBlock::bordered().border_style(dim).title(title).title_top(Line::from(" model    tool ").right_aligned());
+        let room = steps_block.inner(steps);
+        let (width, height) = (room.width as usize, room.height as usize);
+        let from = at.saturating_sub(height / 2).min(rows.len().saturating_sub(height));
+        let lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .skip(from)
+            .take(height)
+            .map(|(i, r)| {
+                let fold = match (r.foldable, r.folded) {
+                    (true, true) => "▸",
+                    (true, false) => "▾",
+                    _ => " ",
+                };
+                let (mark, mark_style) = match (r.kind, r.state) {
+                    (_, trace::State::Running) => (SPINNER[self.spin % SPINNER.len()], Style::new().fg(Color::Yellow)),
+                    (_, trace::State::Failed) => ("✗", Style::new().fg(Color::Red)),
+                    (trace::Kind::Run, _) => ("●", accent),
+                    (trace::Kind::Agent, _) => ("◆", Style::new().fg(Color::Magenta)),
+                    (trace::Kind::Wait, _) => ("⏸", dim),
+                    (trace::Kind::Other, _) => ("·", dim),
+                    _ => ("✓", Style::new().fg(Color::Green)),
+                };
+                let number = if r.number > 0 { format!("{:>2} ", r.number) } else { String::new() };
+                let lead = format!(" {}{fold}", "  ".repeat(r.depth));
+                let time = |ms: Option<i64>| ms.map(crate::telemetry::fmt_ms).unwrap_or_default();
+                let times = format!("{:>8}{:>8} ", time(r.model_ms), time(r.tool_ms));
+                let title_room = width.saturating_sub(lead.chars().count() + 2 + number.chars().count() + times.chars().count()).max(8);
+                let title = format!("{:<title_room$}", first_line(&r.title, title_room));
+                let title_style = match (r.kind, r.state) {
+                    (_, trace::State::Failed) => Style::new().fg(Color::Red),
+                    (trace::Kind::Run, _) => Style::new().add_modifier(Modifier::BOLD),
+                    (trace::Kind::Agent, _) => Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    (trace::Kind::Wait | trace::Kind::Other, _) => dim,
+                    _ => Style::new(),
+                };
+                if i == at {
+                    let whole = format!("{lead}{mark} {number}{title}{times}");
+                    return Line::styled(format!("{whole:<width$}"), Style::new().bg(Color::LightBlue).fg(Color::Black));
+                }
+                Line::from(vec![
+                    Span::styled(lead, dim),
+                    Span::styled(format!("{mark} "), mark_style),
+                    Span::styled(number, dim),
+                    Span::styled(title, title_style),
+                    Span::styled(times, dim),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(if rows.is_empty() { vec![Line::styled(" nothing is recorded for this session yet", dim)] } else { lines }).block(steps_block), steps);
+
+        // The step under the cursor, in full.
+        let detail_block = UiBlock::bordered().border_style(dim);
+        let room = detail_block.inner(detail);
+        let text_w = room.width.saturating_sub(2) as usize;
+        let laid = {
+            let mut cache = view.detail.borrow_mut();
+            let fresh = !matches!(&*cache, Some((id, width, version, _)) if *id == view.sel && *width == text_w && *version == view.version);
+            if fresh {
+                let lines = rows.get(at).map(|r| trace::detail(r, &view.spans, &self.store, now, text_w)).unwrap_or_default();
+                *cache = Some((view.sel, text_w, view.version, lines));
+            }
+            cache.as_ref().map(|c| c.3.clone()).unwrap_or_default()
+        };
+        let scroll = view.scroll.min(laid.len().saturating_sub(room.height as usize));
+        let more = laid.len().saturating_sub(scroll + room.height as usize);
+        let detail_block = detail_block
+            .title(format!(" {} ", rows.get(at).map(|r| first_line(&r.title, text_w.saturating_sub(4))).unwrap_or_default()))
+            .title_bottom(if more > 0 { format!(" {more} more lines · pgdn ") } else { String::new() });
+        let shown: Vec<Line> = laid
+            .iter()
+            .skip(scroll)
+            .take(room.height as usize)
+            .map(|(tone, text)| {
+                let style = match tone {
+                    trace::Tone::Head => accent.add_modifier(Modifier::BOLD),
+                    trace::Tone::Label => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    trace::Tone::Dim => dim,
+                    trace::Tone::Bad => Style::new().fg(Color::Red),
+                    trace::Tone::Text => Style::new(),
+                };
+                Line::styled(format!(" {text}"), style)
+            })
+            .collect();
+        f.render_widget(Paragraph::new(shown).block(detail_block), detail);
+
+        // Where the time went.
+        let parts = trace::spent(&view.spans, now);
+        let total: i64 = parts.iter().map(|p| p.1).sum();
+        let colours = [Color::LightBlue, Color::Green, Color::Yellow, Color::Red];
+        let mut line = vec![Span::raw(" ")];
+        if total > 0 {
+            let bar = (strip.width as usize / 4).clamp(8, 40);
+            for (i, (_, ms)) in parts.iter().enumerate().filter(|(_, p)| p.1 > 0) {
+                let cells = ((*ms as f64 / total as f64) * bar as f64).round().max(1.0) as usize;
+                line.push(Span::styled("█".repeat(cells), Style::new().fg(colours[i])));
+            }
+            for (i, (name, ms)) in parts.iter().enumerate().filter(|(_, p)| p.1 > 0) {
+                line.push(Span::styled("   ■ ", Style::new().fg(colours[i])));
+                line.push(Span::raw(format!("{name} {} ", crate::telemetry::fmt_ms(*ms))));
+                line.push(Span::styled(format!("{}%", (*ms * 100 + total / 2) / total), dim));
+            }
+        } else {
+            line.push(Span::styled("nothing timed yet", dim));
+        }
+        f.render_widget(Paragraph::new(Line::from(line)).block(UiBlock::bordered().border_style(dim).title(" where the time went ")), strip);
+    }
+
     fn draw_overlay(&self, f: &mut Frame, area: Rect) {
         if let Overlay::Themes { sel, before } = &self.overlay {
             return self.draw_themes(f, area, *sel, before);
         }
+        if matches!(self.overlay, Overlay::Trace) {
+            return self.draw_trace(f, area);
+        }
         let (title, lines, sel, hint): (String, Vec<String>, Option<usize>, &str) = match &self.overlay {
-            Overlay::None | Overlay::Themes { .. } => return,
+            Overlay::None | Overlay::Themes { .. } | Overlay::Trace => return,
             Overlay::Sessions { list, sel } => (
                 "sessions".into(),
                 list.iter()
@@ -3670,14 +3989,23 @@ impl App {
         let logs = self.showing_logs();
         let file = self.file_view.is_some() && matches!(self.overlay, Overlay::Text { .. });
         // Log lines are long: the log gets the width of the window.
-        let widest = if logs { 400 } else { 100 };
+        let widest = if logs { 400 } else { 110 };
         let w = area.width.saturating_sub(6).clamp(20, widest).min(area.width);
-        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(4)).max(5).min(area.height);
+        // Room around the text: a line clear above and below it, where the window is not the log.
+        let pad = if logs { 0 } else { 1 };
+        let h = (lines.len() as u16 + 2 + 2 * pad).min(area.height.saturating_sub(4)).max(5).min(area.height);
         let rect = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+        let body = h.saturating_sub(2 + 2 * pad) as usize;
+        let below = match &self.overlay {
+            Overlay::Text { scroll, .. } => lines.len().saturating_sub((*scroll).min(lines.len().saturating_sub(body)) + body),
+            _ => 0,
+        };
+        let hint = if below > 0 && !logs { format!("{below} more below · {hint}") } else { hint.to_string() };
         let block = UiBlock::bordered()
             .border_style(Style::new().fg(Color::LightBlue))
             .title(format!(" {title} "))
-            .title_bottom(format!(" {hint} "));
+            .title_bottom(format!(" {hint} "))
+            .padding(ratatui::widgets::Padding::new(pad, pad, pad, pad));
         let inner = block.inner(rect);
         let room = inner.height as usize;
         let offset = match (&self.overlay, sel) {
@@ -3723,6 +4051,12 @@ impl App {
                         _ => Style::new(),
                     };
                     Line::styled(format!(" {text}"), style)
+                } else if let Some(heading) = text.strip_prefix("# ") {
+                    // A heading: what the lines under it are about.
+                    Line::styled(format!(" {}", heading.to_uppercase()), Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD))
+                } else if let Some(quiet) = text.strip_prefix("~ ") {
+                    // The names of columns, and notes: there to be read once.
+                    Line::styled(format!(" {quiet}"), Style::new().fg(Color::DarkGray))
                 } else {
                     Line::raw(format!(" {text}"))
                 }

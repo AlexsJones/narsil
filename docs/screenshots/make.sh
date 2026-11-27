@@ -71,7 +71,10 @@ say "what happens now if the feed is down?"
 sleep 1
 wait_for "● ready" 30
 say "/usage"; shot usage 1.2; keys Escape; sleep 0.4
-say "/trace"; shot trace 1.2; keys Escape; sleep 0.4
+say "/trace"; sleep 0.8
+for _ in 1 2 3 4 5; do keys Down; done
+shot trace 1; keys Escape; sleep 0.4
+say "/stats"; shot stats 1.2; keys Escape; sleep 0.4
 say "/logs"; shot logs 1.2; keys Escape; sleep 0.4
 say "/theme"; shot themes 1; keys Escape; sleep 0.4
 say "/keys"; shot keys 1; keys Escape; sleep 0.4

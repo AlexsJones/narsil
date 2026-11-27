@@ -10,7 +10,13 @@ narsil trace              # the latest session; or: narsil trace <session or goa
 
 <p align="center"><img src="img/trace.png" alt="The trace of a session: each decision of the model, the tool call it led to, and a subagent's steps nested under the call that started it" width="880"></p>
 
-<p align="center"><sub><code>/trace</code> in the TUI: the same tree, live. A subagent's steps hang under the call that started it.</sub></p>
+<p align="center"><sub><code>/trace</code> in the TUI. Above, the steps: one line each, with how long the model took to ask for it and how long it took to do. Below, the step under the cursor in full. At the foot, where the time went.</sub></p>
+
+In the window, up and down move through the steps; left and right shut and open a request or a
+subagent; page up and down read on through the detail (what the tool was called with, what came
+back, what the model said, its tokens); enter goes to the step in the conversation, opening the
+subagent if it was one's; `e` leaves only what failed; `f` keeps to the latest step while the
+session works.
 
 As text:
 
@@ -41,6 +47,13 @@ the same inside the TUI.
 
 Because a step is recorded when it starts, not when it ends, whatever was running when the daemon
 was killed is on record, and shows in the trace as cut off with how long it had run.
+
+## Totals
+
+`/stats` (and `narsil stats --since 7d` over a period) adds a session up: time on the clock and where
+it went, tokens, the slowest steps, and a table by model and by tool.
+
+<p align="center"><img src="img/stats.png" alt="The stats window: totals for the session, the slowest steps, and tables by model and by tool" width="880"></p>
 
 ## Tokens
 
